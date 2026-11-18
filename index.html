@@ -303,7 +303,7 @@
      6. Privilege Escalation
      7. Domain Admin
      8. Tools (table)
-     9. Detection Rules (defender-facing bullets)
+     9. Remediation (defender-facing fixes)
    Credentials, hashes and flags are always redacted as
    <PASSWORD>, <NEW_PASSWORD>, <NT_hash>, <USER>.
    ============================================================ */
@@ -424,16 +424,14 @@ python3 wmiexec2.py 'anomaly.hsm/anna_molly'@anomaly.hsm -hashes '&lt;NT_hash&gt
         </table>
       </div>
 
-      <h2>Detection Rules</h2>
+      <h2>Remediation</h2>
       <ul>
-        <li>Jenkins authentication with default credentials (<code>admin:admin</code>). Monitor CI/CD logs for successful logins originating from unusual IPs.</li>
-        <li>Execution of <code>/bin/bash</code> or <code>/bin/sh</code> as a child process of the Jenkins Java process.</li>
-        <li>Use of <code>sudo</code> against custom binaries (like <code>router_config</code>) that spawn shells. Monitor command-line arguments passed to NOPASSWD utilities.</li>
-        <li>Reading <code>/etc/krb5.keytab</code> or <code>/etc/shadow</code> by the Jenkins service account.</li>
-        <li>LDAP attributes containing passwords. Alert on any Description fields matching common password patterns.</li>
-        <li>Creation of computer accounts by non-machine users (e.g., <code>Brandon_Boyd</code> creating <code>zero$</code>).</li>
-        <li>ADCS certificate requests where the UPN does not match the requesting account (ESC1).</li>
-        <li>Remote WMI execution spawning PowerShell from a Domain Admin context.</li>
+        <li>Change default Jenkins credentials immediately upon installation. Enforce multi-factor authentication (MFA) for all administrative access to CI/CD platforms.</li>
+        <li>Restrict network access to Jenkins and the Script Console. The Script Console should be disabled for non-administrators and network access to port 8080 should be restricted to trusted IPs.</li>
+        <li>Audit sudoers configurations. Avoid using <code>NOPASSWD</code> for custom binaries. Validate that all scripts and binaries executed as root handle input securely and do not blindly pass arguments to a shell.</li>
+        <li>Enforce strict file permissions on Kerberos keytabs (<code>/etc/krb5.keytab</code>). Service accounts should only have read access to the specific keytab they require.</li>
+        <li>Never store passwords in cleartext within LDAP description fields or other active directory attributes that are readable by authenticated users.</li>
+        <li>Audit Active Directory Certificate Services (ADCS). Disable the <code>Enrollee Supplies Subject</code> flag on certificate templates unless strictly necessary. Remove excessive enrollment rights from low-privileged groups like <code>Domain Computers</code>.</li>
       </ul>
     `
   },
@@ -601,14 +599,14 @@ sudo ip route add 240.0.0.1 dev ligolo</code></pre>
         </table>
       </div>
 
-      <h2>Detection Rules</h2>
+      <h2>Remediation</h2>
       <ul>
-        <li>Anonymous or guest write access to a non-default SMB share. Alert on any <code>TREE_CONNECT</code> and <code>CREATE</code> from a guest-authenticated session to a share outside the standard set.</li>
-        <li>New <code>.lnk</code>, <code>.scf</code> or <code>.url</code> files landing in a share. These have no business in a normal file server and are the ntlm_theft signature.</li>
-        <li>Outbound SMB from a workstation to an unfamiliar IP shortly after a share write. Responder callbacks show up as SMB to the attacker host, not the DC.</li>
-        <li><code>net rpc password</code> against a user the caller does not own. Windows logs this as a password reset event on the target account, with the caller being a different user than the target.</li>
-        <li>MSSQL listening only on loopback combined with an unexplained <code>xp_cmdshell</code> invocation from an account that normally does not use it. SQL Server logs the caller and the command.</li>
-        <li><code>SeImpersonatePrivilege</code> abuse via EfsPotato is visible as a suspicious child process of <code>spoolsv.exe</code> or <code>svchost.exe</code> spawning <code>cmd.exe</code> or <code>powershell.exe</code> from a service account.</li>
+        <li>Disable anonymous and guest access to SMB shares. Enforce strict ACLs on file shares so that only authenticated, authorized users have write access.</li>
+        <li>Implement SMB Signing to prevent NTLM relay attacks and restrict outbound SMB traffic to prevent Responder hash captures.</li>
+        <li>Audit Active Directory ACLs. Ensure that standard users do not have <code>GenericAll</code>, <code>WriteOwner</code>, or <code>GenericWrite</code> permissions over privileged accounts or groups.</li>
+        <li>Restrict access to management interfaces like WinRM to dedicated administrative VLANs or jump hosts.</li>
+        <li>Bind database services (like MSSQL) to specific internal interfaces rather than <code>0.0.0.0</code> if external access is not required. Disable <code>xp_cmdshell</code> on production SQL servers.</li>
+        <li>Remove <code>SeImpersonatePrivilege</code> from service accounts that do not explicitly require it. If it is required, ensure the service runs under a low-privileged virtual account and implement application allow-listing to prevent rogue binary execution.</li>
       </ul>
     `
   },
@@ -731,14 +729,14 @@ reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
         </table>
       </div>
 
-      <h2>Detection Rules</h2>
+      <h2>Remediation</h2>
       <ul>
-        <li>Kerberoasting: a single account requesting TGS tickets for many SPN-bearing accounts in a short window, or a service account whose password has not rotated in over a year receiving a TGS request from a workstation context.</li>
-        <li>Remote password resets via RPC from a user other than the target. Windows logs a <code>4724</code> on the target, with the subject being the resetting account.</li>
-        <li>LNK files in a share referencing an external IP. This is the same class of indicator as ShareThePain: any <code>.lnk</code> in a file server share should be treated as suspicious.</li>
-        <li>Outbound authentication from a workstation to an IP outside the internal range, which is what Responder catches.</li>
-        <li>SeBackupPrivilege use by a non-admin service account, especially <code>reg save</code> against HKLM\\SAM or HKLM\\SYSTEM. Windows logs the process and the calling account; the process is <code>reg.exe</code> under a user who should not have that privilege.</li>
-        <li>Pass-the-hash: a logon with an NT hash rather than a password leaves an NTLM authentication event without a matching <code>4768</code> or <code>4769</code> Kerberos request for the same account in the expected window.</li>
+        <li>Remove sensitive data from public or unsecured databases. Implement strict hashing (bcrypt/Argon2 with salts) for credentials stored in internal applications.</li>
+        <li>Enforce strong password policies and rotate service account passwords regularly to mitigate Kerberoasting. Use Group Managed Service Accounts (gMSAs) where possible.</li>
+        <li>Audit Active Directory ACLs to remove excessive password reset rights (like <code>GenericAll</code>) from standard users.</li>
+        <li>Prevent NTLM theft by disabling NTLMv1 and restricting outbound SMB. Educate users on the risks of opening unexpected files (like LNK files) from file shares.</li>
+        <li>Remove <code>SeBackupPrivilege</code> from non-essential accounts. Restrict access to registry hives and sensitive system files.</li>
+        <li>Implement the Local Administrator Password Solution (LAPS) to ensure unique, rotated local administrator passwords across all workstations and servers, preventing pass-the-hash lateral movement.</li>
       </ul>
     `
   }

